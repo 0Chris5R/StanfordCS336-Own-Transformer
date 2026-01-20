@@ -1,0 +1,1 @@
+{"grad_norm":2.441154956817627,"_runtime":12.5978675,"_timestamp":1.768748011545402e+09,"_step":0,"lr":0,"weight_norm":152.1121826171875,"_wandb":{"runtime":12},"val/loss":9.242254257202148,"val/perplexity":10324.285941218008,"train/loss":9.245709419250488}

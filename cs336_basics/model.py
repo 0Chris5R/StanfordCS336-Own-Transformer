@@ -1,0 +1,504 @@
+import torch
+import torch.nn as nn
+import math
+from einops import einsum, rearrange
+
+
+class Linear(nn.Module):
+    def __init__(self, in_features, out_features, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.W = nn.Parameter(torch.empty(
+            out_features, in_features, device=device, dtype=dtype))
+
+        sigma = math.sqrt(2/(in_features+out_features))
+        nn.init.trunc_normal_(self.W, mean=0, std=sigma, a=-3*sigma, b=3*sigma)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        return einsum(x, self.W, "... d_in, d_out d_in -> ... d_out")
+
+
+class Embedding(nn.Module):
+
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.E = nn.Parameter(torch.empty(
+            num_embeddings, embedding_dim, device=device, dtype=dtype))
+
+        sigma = math.sqrt(2/(num_embeddings+embedding_dim))
+        nn.init.trunc_normal_(self.E, mean=0, std=sigma, a=-3*sigma, b=3*sigma)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+
+        return self.E[token_ids, :]
+
+
+class RMSNorm(nn.Module):
+
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.G = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+
+        rms = torch.sqrt(1/self.d_model *
+                         torch.sum(x**2, dim=-1, keepdim=True)+self.eps)
+
+        return (x/rms * self.G).to(in_dtype)
+
+
+class SwiGLU(nn.Module):
+
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.W1 = nn.Parameter(torch.empty(
+            d_ff, d_model, device=device, dtype=dtype))
+        self.W2 = nn.Parameter(torch.empty(
+            d_model, d_ff, device=device, dtype=dtype))
+        self.W3 = nn.Parameter(torch.empty(
+            d_ff, d_model, device=device, dtype=dtype))
+
+        sigma = math.sqrt(2/(d_ff + d_model))
+        nn.init.trunc_normal_(self.W1, mean=0, std=sigma,
+                              a=-3*sigma, b=3*sigma)
+        nn.init.trunc_normal_(self.W2, mean=0, std=sigma,
+                              a=-3*sigma, b=3*sigma)
+        nn.init.trunc_normal_(self.W3, mean=0, std=sigma,
+                              a=-3*sigma, b=3*sigma)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        w1x = einsum(self.W1, x, "d_ff d_model, ... d_model -> ... d_ff")
+        w3x = einsum(self.W3, x, "d_ff d_model, ... d_model -> ... d_ff")
+        silu = w1x * self.sigmoid(w1x)
+
+        return einsum(self.W2, silu * w3x, "d_model d_ff, ... d_ff -> ... d_model")
+
+    def sigmoid(self, x: torch.Tensor) -> torch.Tensor:
+
+        neg_abs_x = -x.abs()
+        exp_neg_abs_x = torch.exp(neg_abs_x)
+        pos_sigmoid = 1/(1+exp_neg_abs_x)
+
+        return torch.where(x >= 0, pos_sigmoid, 1-pos_sigmoid)
+
+
+class RoPE(nn.Module):
+
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None, dtype=None):
+
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        self.device = device
+        self.dtype = dtype
+        cos, sin = self.precompute_rope(self.max_seq_len, self.d_k)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+
+        # fetch buffered rope for idx token_positions and handle batching over n_heads:
+
+        if token_positions is None:
+            token_positions = torch.arange(
+                x.shape[-2], device=x.device, dtype=x.dtype)
+        cos = self.cos[..., token_positions, :]
+        sin = self.sin[..., token_positions, :]
+
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x1 = x_even * cos - x_odd * sin
+        x2 = x_even * sin + x_odd * cos
+
+        x[..., 0::2] = x1
+        x[..., 1::2] = x2
+
+        return x
+
+    def precompute_rope(self, seq_len: int, d: int) -> tuple[torch.Tensor]:
+
+        # precompute rope for (seq_len, d)
+
+        # pair index
+        k = torch.arange(0, d//2, device=self.device, dtype=self.dtype)
+        base_frequency = self.theta ** (-2*k/d)
+        # position index
+        i = torch.arange(0, seq_len, device=self.device, dtype=self.dtype)
+        # cartesian product i x k
+        angle = i[:, None] * base_frequency[None, :]
+
+        # shape seq_len, dim/2
+        cos = torch.cos(angle)
+        sin = torch.sin(angle)
+
+        # add batch and head axis for later broadcasting:
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+
+        return cos.to(self.device), sin.to(self.device)
+
+
+def softmax(x: torch.Tensor, d: int = -1, temperature=1) -> torch.Tensor:
+
+    x = torch.exp((x-torch.max(x, dim=d, keepdim=True).values)/temperature)
+
+    return x/torch.sum(x, dim=d, keepdim=True)
+
+
+class MultiHeadSelfAttention(nn.Module):
+
+    def __init__(self, d_model: int, num_heads: int, rope: nn.Module = None,  device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        if rope is not None:
+            self.rope = rope
+        self.WQ = nn.Parameter(torch.empty(
+            d_model, d_model, device=device, dtype=dtype))
+        self.WK = nn.Parameter(torch.empty(
+            d_model, d_model, device=device, dtype=dtype))
+        self.WV = nn.Parameter(torch.empty(
+            d_model, d_model, device=device, dtype=dtype))
+        self.WO = nn.Parameter(torch.empty(
+            d_model, d_model, device=device, dtype=dtype))
+
+        sigma = math.sqrt(2/(d_model + d_model))
+        nn.init.trunc_normal_(
+            self.WQ, mean=0.0, std=sigma, a=-3*sigma, b=3*sigma)
+        nn.init.trunc_normal_(
+            self.WK, mean=0.0, std=sigma, a=-3*sigma, b=3*sigma)
+        nn.init.trunc_normal_(
+            self.WV, mean=0.0, std=sigma, a=-3*sigma, b=3*sigma)
+        nn.init.trunc_normal_(
+            self.WO, mean=0.0, std=sigma, a=-3*sigma, b=3*sigma)
+
+    def forward(self, x: torch.Tensor, token_positions: int = None):
+
+        # calculate causal mask:
+
+        mask = torch.tril(torch.ones(
+            x.shape[-2], x.shape[-2], device=x.device), diagonal=0).bool()
+
+        # Apply projection matrix and split d_model into n_heads, d_head + move n_heads to the front as batch dimension
+
+        Q = einsum(
+            x, self.WQ, "... seq_len d_model, d_keys d_model -> ... seq_len d_keys")
+        Q = rearrange(
+            Q, "... seq_len (n_heads d_head) -> ... n_heads seq_len d_head", n_heads=self.num_heads)
+
+        K = einsum(
+            x, self.WK, "... seq_len d_model, d_keys d_model -> ... seq_len d_keys")
+        K = rearrange(
+            K, "... seq_len (n_heads d_head) -> ... n_heads seq_len d_head", n_heads=self.num_heads)
+
+        V = einsum(
+            x, self.WV, "... seq_len d_model, d_values d_model -> ... seq_len  d_values")
+        V = rearrange(
+            V, "... seq_len (n_heads d_head) -> ... n_heads seq_len d_head", n_heads=self.num_heads)
+
+        # Apply RoPE
+        if hasattr(self, "rope"):
+            Q = self.rope.forward(Q, token_positions)
+            K = self.rope.forward(K, token_positions)
+
+        # Calculate Attention
+        output = self.scaled_dot_product_attention(Q, K, V, mask=mask)
+        # Concatenate heads
+        output = rearrange(
+            output, "... n_heads seq_len d_head -> ... seq_len (n_heads d_head)")
+        # Apply output projection
+        return einsum(output, self.WO, "... seq_len d_V, d_model d_V -> ... seq_len d_model")
+
+    @staticmethod
+    def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+
+        d_k = K.shape[-1]
+
+        scores = einsum(
+            Q, K, "... seq_len1 d_k, ... seq_len2 d_k -> ... seq_len1 seq_len2")/math.sqrt(d_k)
+
+        if mask is not None:
+            scores = scores.masked_fill(~mask, -float('inf'))
+
+        return einsum(softmax(scores), V, "... seq_len1 seq_len2, ... seq_len2 d_v -> ... seq_len1 d_v")
+
+
+class TransformerBlock(nn.Module):
+
+    def __init__(self, d_model: int, d_ff: int, num_heads: int, weights: dict[str, torch.Tensor], rope, device=None, dtype=None, eps=1e-5, norm=True):
+
+        super().__init__()
+
+        self.device = device
+
+        self.rope = rope
+
+        if norm:
+
+            self.rmsnorm1 = RMSNorm(d_model, eps, device, dtype)
+
+            self.rmsnorm2 = RMSNorm(d_model, eps, device, dtype)
+
+        self.mha = MultiHeadSelfAttention(
+            d_model, num_heads, rope=rope, device=device, dtype=dtype)
+
+        self.ffn = SwiGLU(d_model, d_ff, device, dtype)
+
+        if weights is not None:
+            self.ffn.load_state_dict(
+                {"W1": weights["ffn.w1.weight"], "W2": weights["ffn.w2.weight"], "W3": weights["ffn.w3.weight"]})
+            self.mha.load_state_dict({"WQ": weights["attn.q_proj.weight"], "WK": weights["attn.k_proj.weight"],
+                                      "WV": weights["attn.v_proj.weight"], "WO": weights["attn.output_proj.weight"]})
+            if norm:
+                self.rmsnorm1.load_state_dict({"G": weights["ln1.weight"]})
+                self.rmsnorm2.load_state_dict({"G": weights["ln2.weight"]})
+
+    def forward(self, x, norm=True):
+
+        if norm:
+            # Sublayer 1:
+            x = x + self.mha(self.rmsnorm1(x),
+                             torch.arange(x.shape[-2], device=self.device))
+
+            # Sublayer 2:
+            return x + self.ffn(self.rmsnorm2(x))
+
+        x = x + self.mha(x, torch.arange(x.shape[-2], device=self.device))
+        return x + self.ffn(x)
+
+
+class Transformer(nn.Module):
+
+    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta, weights, device, dtype, norm=True, rope=True):
+
+        super().__init__()
+
+        self.device = device
+        self.dtype = dtype
+        self.d_model = d_model
+        self.context_length = context_length
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.vocab_size = vocab_size
+        self.d_ff = d_ff
+
+        self.embedding = Embedding(vocab_size, d_model, device, dtype)
+
+        if rope is True:
+            self.rope = RoPE(rope_theta, d_model/num_heads,
+                             context_length, device, dtype)
+        else:
+            self.rope = None
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                d_ff=d_ff,
+                num_heads=num_heads,
+                weights=None if weights is None else {
+                    k.replace(f"layers.{i}.", ""): v
+                    for k, v in weights.items()
+                    if k.startswith(f"layers.{i}.")
+                },
+                rope=self.rope,
+                device=device,
+                dtype=dtype,
+                eps=1e-5, norm=norm
+            )
+            for i in range(num_layers)
+        ])
+
+        if norm is True:
+            self.ln_final = RMSNorm(d_model=d_model, eps=1e-5,
+                                    device=device, dtype=dtype)
+
+        self.output = Linear(d_model, vocab_size, device, dtype)
+
+        if weights is not None:
+            self.output.load_state_dict({"W": weights["lm_head.weight"]})
+            self.embedding.load_state_dict(
+                {"E": weights["token_embeddings.weight"]})
+            if norm is True:
+                self.ln_final.load_state_dict(
+                    {"G": weights["ln_final.weight"]})
+
+    def forward(self, x, norm=True):
+
+        x = self.embedding(x)
+
+        for layer in self.layers:
+            x = layer(x, norm=norm)
+
+        # output projection onto vocabulary:
+        if norm is True:
+            return self.output(self.ln_final(x))
+        return self.output(x)
+
+    def get_flops(self, verbose=False):
+
+        # FLOP calculations only considering Matmuls and an input sequence of context_length
+        # (each matmul (m,n) @ (n,k) is multiply + add -> 2FLOPS * m*n*k
+
+        # 1. Embedding Layer: no matmuls (we simply index the Embedding matrix)
+        # 2. RMSNorm: no matmuls
+        # 3. FFN:
+        # x @ W1 (seq_len, d_model) @ (d_model, d_ff) - same for x @ W3 and y @ W2
+        # Complexty:O(d * d_ff *T)
+        flops_ffn = 3 * self.d_model * self.d_ff * self.context_length * 2
+        # 4. MHA:
+        # 4.1 Projections: xWq, xWk, xWv, xWO (assuming d_k = d_V = d_model)
+        # (seq_len, d_model) @ (d_model, d_model) Complexity: O(d^2*T)
+        flops_attention = 4 * self.d_model ** 2 * self.context_length * 2
+        # 4.2 Attention calculations
+        # scores: (seq_len, d_model) @ (d_model, seq_len) Complexity: O(T^2*d)
+        flops_attention += self.context_length ** 2 * self.d_model * 2
+        # scores @ V (seq_len, seq_len) @ (seq_len, d_model) Complexity: O(T^2*d)
+        flops_attention += self.context_length ** 2 * self.d_model * 2
+
+        # Multiply by number of layers
+        flops = flops_ffn + flops_attention
+        flops *= self.num_layers
+
+        # 5. Output Projection : (seq_len, d_model) (d_model, vocab_size)
+        flops_output = self.context_length * self.d_model * self.vocab_size * 2
+        flops += flops_output
+
+        if verbose:
+            print(
+                f"The model has a total of {flops/1e9:.2f} GFLOPS for one forward pass")
+            print(
+                f"Attention: {flops_attention*self.num_layers*100/flops:.2f} % of FLOPS")
+            print(f"FFN: {flops_ffn*self.num_layers*100/flops:.2f} % of FLOPS")
+            print(
+                f"Output Projection: {flops_output*100/flops:.2f} % of FLOPS")
+        return flops
+
+    def get_parameters(self, verbose=False):
+        parameters = sum(p.numel() for p in self.parameters())
+        if verbose:
+            print(
+                f"The model has a total of {parameters/1e6:.2f} M Parameters")
+        return parameters
+
+    def get_activation_size(self, verbose=False):
+
+        memory = 0
+
+        # 2. RMSNorm: no matmuls (context_len, d_model)
+        memory += self.context_length * self.d_model
+        # 3. FFN:
+        # x @ W1, x @ W3 -> (context_len, d_ff), y @ W2 -> (context_len, d_model)
+        memory += self.context_length * self.d_ff * \
+            2 + self.context_length * self.d_model
+        # 4. MHA:
+        # 4.1 Projections: xWq, xWk, xWv, xWO (assuming d_k = d_V = d_model)
+        memory += self.context_length * self.d_model * 4
+        # 4.2 Attention calculations
+        # scores:
+        memory += self.context_length ** 2
+        # scores @ V
+        memory += self.context_length * self.d_model
+        # Multiply by number of layers
+        memory *= self.num_layers
+
+        # 1. Embedding Layer: (context_len, d_model)
+        memory += self.context_length * self.d_model
+        # 5. Output Projection + final RMS norm:
+        memory += self.context_length * self.d_model + \
+            self.context_length * self.vocab_size
+        memory *= torch.tensor([], dtype=self.dtype).element_size()
+
+        if verbose:
+            print(
+                f"The model activations consume a total memory of {memory/(1024**3):.2f} GB ")
+
+        return memory
+
+    def get_memory(self, verbose=False):
+        parameters = self.get_parameters()
+        memory = parameters * torch.tensor([], dtype=self.dtype).element_size()
+        if verbose:
+            print(
+                f"The model consumes a total memory of {memory/(1024**3):.2f} GB ")
+        return memory
+
+    def get_training_flops(self, verbose=False):
+
+        flops = self.get_flops() * 3 + 17 * self.get_parameters()
+
+        if verbose:
+            print(
+                f"Training the model takes a total of {flops/1e9:.2f} GFLOPS per batch per step")
+        return flops
+
+    def get_training_memory(self, verbose=False, batch_size=1):
+
+        memory = self.get_activation_size() * batch_size + self.get_memory() * 4
+
+        if verbose:
+            print(
+                f"Training the model with ADAMW as optimizer consumes a total memory of {memory/(1024**3):.2f} GB")
+
+        return memory
+
+    def get_training_time(self, verbose=False, steps=None, batch_size=None):
+
+        # For Macbook Pro M3 with MPS we can assume a realistic throughput of 10-20% of max throughput (7.4 TFLOP/S)
+        throughput = 1.15 * 1e12
+
+        # FLOPS per step of training:
+        flops = self.get_training_flops()
+
+        if steps is None:
+            # Assuming Chinchillas Law (we want to train on roughly 20 * parameters tokens).
+
+            tokens = 20 * self.get_parameters()
+
+            # For a given context length we can fit len(context_window) tokens per step
+            steps = tokens/self.context_length
+
+            chincilla_training_time = flops * steps / throughput
+
+            if verbose:
+                print(
+                    f"Training the model locally according to Chincillas Law will take roughly {chincilla_training_time / 3600:.2f} hours")
+            return chincilla_training_time
+
+        else:
+            training_time = flops * batch_size * steps / throughput
+            if verbose:
+                print(
+                    f"Training the model locally will take roughly {training_time / 3600:.2f} hours")
+            return training_time
+
+
+# Calculations for GPT-2 XL:
+# transformer = Transformer(50257, 1024, 1600, 48, 25,
+#                           6400, 1, None, None, torch.float32)
+
+# for reasonably sized local model:
+# transformer = Transformer(50257, 1024, 768, 12, 6,
+#                           3072, 10000, None, None, torch.float32)
+
+
+# transformer.get_parameters(verbose=True)
+# transformer.get_memory(verbose=True)
+# transformer.get_flops(verbose=True)
+# transformer.get_activation_size(verbose=True)
+# transformer.get_training_flops(verbose=True)
+# transformer.get_training_memory(verbose=True, batch_size=32)
+# transformer.get_training_time(verbose=True)

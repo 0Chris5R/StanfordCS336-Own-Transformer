@@ -1,0 +1,4 @@
+wandb_version: 1
+
+max_learning_rate:
+  value: 0.018848134655294065

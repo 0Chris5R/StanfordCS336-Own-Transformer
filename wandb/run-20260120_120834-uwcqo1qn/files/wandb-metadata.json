@@ -1,0 +1,36 @@
+{
+  "os":  "macOS-26.2-arm64-arm-64bit",
+  "python":  "CPython 3.12.11",
+  "startedAt":  "2026-01-20T11:08:34.837134Z",
+  "program":  "/Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics/cs336_basics/train_model.py",
+  "codePath":  "cs336_basics/train_model.py",
+  "codePathLocal":  "cs336_basics/train_model.py",
+  "git":  {
+    "commit":  "430e2c844e29f8aad8f9330e8706db9cb508241f"
+  },
+  "email":  "reuterchris05@gmail.com",
+  "root":  "/Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics",
+  "host":  "CVH6FWYQJ5",
+  "executable":  "/Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics/.venv/bin/python",
+  "cpu_count":  12,
+  "cpu_count_logical":  12,
+  "disk":  {
+    "/":  {
+      "total":  "494384795648",
+      "used":  "459017211904"
+    }
+  },
+  "memory":  {
+    "total":  "38654705664"
+  },
+  "apple":  {
+    "name":  "Apple M3 Pro",
+    "ecpuCores":  6,
+    "pcpuCores":  6,
+    "gpuCores":  18,
+    "memoryGb":  36,
+    "swapTotalBytes":  "7516192768",
+    "ramTotalBytes":  "38654705664"
+  },
+  "writerId":  "cisvyz3q29z3wp6tt2a2o3n4ni2wmd72"
+}

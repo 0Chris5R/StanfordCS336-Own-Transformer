@@ -1,0 +1,405 @@
+"""Training utilities for the CS336 basics assignment."""
+
+import torch
+import math
+from typing import Iterable
+import numpy as np
+import os
+import typing
+from cs336_basics.model import Transformer, softmax
+import wandb
+from cs336_basics.tokenizer import BPETokenizer
+
+
+def cross_entropy(x: torch.Tensor, targets: torch.Tensor) -> float:
+
+    # Using Log Sum exp trick:
+
+    m = torch.max(x, dim=-1, keepdim=True).values
+    return torch.mean((-x + m + torch.log(torch.sum(torch.exp(x-m), dim=-1, keepdim=True)))[torch.arange(x.shape[0]), targets])
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-7, cautious_weight_decay=False):
+
+        defaults = {"lr": lr, "beta1": betas[0],
+                    "beta2": betas[1], "eps": eps, "lam": weight_decay}
+        super().__init__(params, defaults)
+        self.cautious_weight_decay = cautious_weight_decay
+
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1 = group["beta1"]
+            beta2 = group["beta2"]
+            eps = group["eps"]
+            lam = group["lam"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["velocity"] = torch.zeros_like(p)
+                    state["momentum"] = torch.zeros_like(p)
+                    state["step"] = 1
+
+                v = state["velocity"]
+                m = state["momentum"]
+                step = state["step"]
+
+                grad = p.grad.data
+
+                m.lerp_(grad, 1-beta1)
+                v.lerp_(grad.square(), 1-beta2)
+
+                bias_1 = 1-beta1**step
+                bias_2 = 1-beta2**step
+
+                step_size = lr/bias_1
+
+                denom = torch.sqrt(v/bias_2) + eps
+
+                update = m/denom
+
+                # cautious weight decay: only applies weight decay for parameters where update direction and weights align
+                if self.cautious_weight_decay is True:
+
+                    p.add_(p * (p * update >= 0), alpha=-lr*lam)
+
+                # normal decoupled weigth decay:
+                else:
+                    p.mul_(1 - lr * lam)
+
+                p.add_(update, alpha=-step_size)
+
+                state["step"] += 1
+
+        return loss
+
+
+def lr_scheduler(t, max_learning_rate: float,
+                 min_learning_rate: float,
+                 warmup_iters: int,
+                 cosine_cycle_iters: int,) -> float:
+
+    if t < warmup_iters:
+        return (t/warmup_iters)*max_learning_rate
+
+    if t > cosine_cycle_iters:
+        return min_learning_rate
+
+    return min_learning_rate + 0.5 * (1 + math.cos((t - warmup_iters)/(cosine_cycle_iters-warmup_iters) * math.pi)) * (max_learning_rate-min_learning_rate)
+
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+
+    grad_norm = 0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+
+        grad_norm += torch.sum(parameter.grad ** 2)
+
+    grad_norm = torch.sqrt(grad_norm).item()
+
+    if grad_norm > max_l2_norm:
+        scale = max_l2_norm/grad_norm
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            parameter.grad.mul_(scale)
+
+
+def get_batch(dataset: np.ndarray | str, batch_size: int, context_length: int, device: str
+              ) -> tuple[torch.Tensor, torch.Tensor]:
+
+    if isinstance(dataset, str):
+        dataset = np.load(dataset, mmap_mode='r')
+
+    random = np.random.default_rng()
+    starting_indices = random.integers(
+        0, len(dataset)-context_length, batch_size)
+
+    inputs = [dataset[i:i+context_length] for i in starting_indices]
+    targets = [dataset[i+1:i+1+context_length] for i in starting_indices]
+
+    inputs = torch.tensor(np.stack(inputs), device=device, dtype=torch.int32)
+    targets = torch.tensor(np.stack(targets), device=device, dtype=torch.int32)
+
+    return inputs, targets
+
+
+def save_checkpoint(model: torch.nn.Module,
+                    optimizer: torch.optim.Optimizer,
+                    iteration: int,
+                    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes], run_id=None, model_config=None) -> None:
+
+    torch.save({"model": model.state_dict(),
+               "optimizer": optimizer.state_dict(), "iteration": iteration, "run_id": run_id, "model_config": model_config}, out)
+
+
+def load_checkpoint(
+        src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+        model: torch.nn.Module = None,
+        optimizer: torch.optim.Optimizer = None) -> tuple[int, typing.Any, typing.Optional[dict]]:
+
+    if src is None or not os.path.exists(src):
+        print("No model to load - starting from scratch")
+        return (0, None, None)
+
+    checkpoint = torch.load(src)
+    checkpoint["model"] = {k.replace("_orig_mod.", ""): v for k,
+                           v in checkpoint["model"].items()}
+    if model is not None:
+        model.load_state_dict(checkpoint["model"])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+
+    print(f"Successfully loaded previous model checkpoint from {src}")
+
+    return (checkpoint["iteration"], checkpoint["run_id"], checkpoint["model_config"])
+
+
+def train_together(
+    d_model: int = 512,
+    num_layers: int = 4,
+    num_heads: int = 16,
+    d_ff: int = 1344,
+    rope_theta: float = 10000.0,
+    vocab_size: int = 10000,
+    train_path: str = "../data/TinyStoriesV2-GPT4-train.npy",
+    val_path: str = "../data/TinyStoriesV2-GPT4-val.npy",
+    tokenizer_path: str = "../checkpoints/tokenizer_tiny_stories.model",
+    batch_size: int = 32,
+    context_length: int = 256,
+    steps: int = 5000,
+    max_learning_rate: float = 5e-4,
+    max_l2_norm: float = 1.0,
+    device: torch.device = torch.device("mps"),
+    dtype: torch.dtype = torch.float32,
+    load_model_path: str | None = None,
+    save_model_path: str | None = None,
+    weight_decay: float = 0.01,
+    betas: tuple[float, float] = (0.9, 0.95),
+    norm=True,
+    rope=True,
+    cautious_weight_decay=False
+
+) -> None:
+
+    cosine_cycle_iters = steps
+    warmup_iters = min(100, int(0.02*steps))
+    min_learning_rate = 0.1 * max_learning_rate
+
+    model = Transformer(vocab_size, context_length, d_model, num_layers,
+                        num_heads, d_ff, rope_theta, None, device, dtype, norm=norm, rope=rope)
+
+    optimizer = AdamW(model.parameters(), min_learning_rate,
+                      weight_decay, betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
+
+    tokenizer = BPETokenizer()
+    tokenizer.load(tokenizer_path)
+
+    iteration, run_id, model_config = load_checkpoint(
+        load_model_path, model, optimizer)
+
+    if model_config is None:
+        model_config = {"vocab_size": vocab_size, "context_length": context_length, "d_model": d_model, "num_layers": num_layers,
+                        "num_heads": num_heads, "d_ff": d_ff, "rope_theta": rope_theta, "weights": None, "device": device, "dtype": dtype}
+
+    print("Starting training")
+    num_parameters = model.get_parameters(verbose=True)
+    model.get_training_memory(verbose=True, batch_size=batch_size)
+    model.get_training_time(verbose=True, steps=steps, batch_size=batch_size)
+    print(f"Training on {model.device}")
+
+    print("Compiling model")
+    model = torch.compile(model, backend="aot_eager")
+
+    wandb.init(
+        project="Transformer-from-scratch",
+        name="small-model",
+        id=run_id,
+        resume="allow",
+        config={
+            "max_lr": max_learning_rate,
+            "batch_size": batch_size,
+            "optimizer": "adamw",
+            "model parameters in Million": round(num_parameters/1e6, 2),
+            "steps": steps,
+        }
+    )
+
+    run_id = wandb.run.id
+
+    best_val_loss = float("inf")
+
+    for step in range(iteration, steps):
+
+        lr = lr_scheduler(step, max_learning_rate,
+                          min_learning_rate, warmup_iters, cosine_cycle_iters)
+
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+        loss = train_step(model, optimizer, train_path,
+                          batch_size, context_length, device, max_l2_norm, norm=norm)
+
+        if step % 10 == 0:
+            param_norm = torch.sqrt(
+                sum(p.norm()**2 for p in model.parameters())).item()
+
+            grad_norm = torch.sqrt(
+                sum(p.grad.norm()**2 for p in model.parameters() if p.grad is not None)).item()
+
+            wandb.log({
+                "train/loss": loss,
+                "lr": lr,
+                "grad_norm": grad_norm,
+                "weight_norm": param_norm
+
+            }, step=step)
+
+        if step % 250 == 0:
+            val_loss = val_step(model, val_path, batch_size,
+                                context_length, device, norm=norm)
+
+            wandb.log({
+                "val/loss": val_loss,
+                "val/perplexity": math.exp(val_loss),
+            }, step=step)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+
+                if step % 1000 == 0 and save_model_path is not None:
+                    save_checkpoint(model, optimizer, step,
+                                    save_model_path, run_id, model_config)
+
+                    print(
+                        "Sampling a model generation to see current performance - Once upon a time: ...")
+                    decode(model, tokenizer=tokenizer,
+                           x="Once upon a time", num_tokens=20, temperature=0.8, top_p_threshold=0.9, norm=norm)
+
+    wandb.finish()
+
+
+def train_step(model, optimizer, train_path, batch_size, context_length, device, max_l2_norm, norm=True) -> float:
+
+    inputs, targets = get_batch(
+        dataset=train_path, batch_size=batch_size, context_length=context_length, device=device)
+
+    model.train()
+    logits = model(inputs, norm)
+    loss = cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        targets.view(-1))
+
+    optimizer.zero_grad()
+
+    loss.backward()
+
+    gradient_clipping(model.parameters(), max_l2_norm)
+
+    optimizer.step()
+
+    return loss.item()
+
+
+def val_step(model, val_path, batch_size, context_length, device, norm=True) -> float:
+
+    with torch.inference_mode():
+
+        losses = []
+
+        for _ in range(5):
+
+            inputs, targets = get_batch(
+                dataset=val_path, batch_size=batch_size, context_length=context_length, device=device)
+
+            model.eval()
+
+            logits = model(inputs, norm)
+            loss = cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1)
+            )
+
+            losses.append(loss)
+
+        return torch.mean(torch.stack(losses)).item()
+
+
+def decode(model_path, tokenizer, x, num_tokens, temperature=1, top_p_threshold=1, norm=True, rope=True) -> None:
+
+    # Can take in either model path or model
+
+    if isinstance(model_path, str):
+
+        _, _, config = load_checkpoint(model_path, None, None)
+        # Instantiate the Transformer using the saved config
+        model = Transformer(
+            vocab_size=config["vocab_size"],
+            context_length=config["context_length"],
+            d_model=config["d_model"],
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"],
+            d_ff=config["d_ff"],
+            rope_theta=config["rope_theta"],
+            weights=config["weights"],
+            device=config["device"],
+            dtype=config["dtype"],
+            norm=norm,
+            rope=rope
+
+        )
+
+        _, _, _ = load_checkpoint(model_path, model, None)
+
+    else:
+        model = model_path
+
+    # our model takes tensor(batch, seq) as input
+    x = torch.tensor(tokenizer.encode(x), device=model.device).unsqueeze(0)
+
+    with torch.inference_mode():
+
+        model.eval()
+
+        for _ in range(num_tokens):
+
+            logits = model(x, norm)[0, -1, :]
+
+            probabilities = softmax(logits, d=-1, temperature=temperature)
+
+            # nucleus sampling:
+            probabilities, indices = torch.sort(probabilities, descending=True)
+            cumulative_probs = torch.cumsum(probabilities, dim=0)
+            mask = cumulative_probs <= top_p_threshold
+            # if the model is so confident that the first probability already exceeds the threshold we need to include at least that token
+            if not mask.any():
+                mask[0] = True
+            top_p = probabilities[mask]
+            top_p = top_p / top_p.sum()
+
+            # sample:
+            token_id = indices[torch.multinomial(top_p, num_samples=1)]
+
+            # stop if token is <|endoftext|>
+            if token_id.item() == 256:
+                return
+
+            token = tokenizer.decode([token_id.item()])
+
+            print(token, end="", flush=True)
+
+            x = torch.cat([x, token_id.unsqueeze(0)], dim=1)
+
+        print()

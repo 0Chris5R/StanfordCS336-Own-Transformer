@@ -1,0 +1,1 @@
+{"_wandb":{"runtime":21},"weight_norm":152.0712890625,"_runtime":21.469487292,"train/loss":9.225200653076172,"val/perplexity":10225.15289794101,"_step":0,"grad_norm":2.3723349571228027,"val/loss":9.232605934143066,"_timestamp":1.768747249880662e+09,"lr":0}

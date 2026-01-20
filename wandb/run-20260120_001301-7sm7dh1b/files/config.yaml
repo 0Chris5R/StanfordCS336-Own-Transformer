@@ -1,0 +1,36 @@
+_wandb:
+    value:
+        cli_version: 0.21.2
+        e:
+            5i6yhp8wgov1ymx6z1mxhku2wyqqh1vv:
+                codePath: cs336_basics/train_model.py
+                codePathLocal: cs336_basics/train_model.py
+                email: reuterchris05@gmail.com
+                executable: /Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics/.venv/bin/python
+                git:
+                    commit: 430e2c844e29f8aad8f9330e8706db9cb508241f
+                    remote: https://github.com/stanford-cs336/assignment1-basics.git
+                host: CVH6FWYQJ5
+                os: macOS-26.2-arm64-arm-64bit
+                program: /Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics/cs336_basics/train_model.py
+                python: CPython 3.12.11
+                root: /Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics
+                startedAt: "2026-01-19T23:13:01.922381Z"
+                writerId: 5i6yhp8wgov1ymx6z1mxhku2wyqqh1vv
+        m: []
+        python_version: 3.12.11
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 14
+                - 24
+            "4": 3.12.11
+            "5": 0.21.2
+            "12": 0.21.2
+            "13": darwin-arm64
+batch_size:
+    value: 64

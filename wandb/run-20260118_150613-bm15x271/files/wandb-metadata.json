@@ -1,0 +1,17 @@
+{
+  "os":  "macOS-26.2-arm64-arm-64bit",
+  "python":  "CPython 3.12.11",
+  "startedAt":  "2026-01-18T14:06:13.620108Z",
+  "program":  "/Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics/cs336_basics/train_model.py",
+  "codePath":  "cs336_basics/train_model.py",
+  "codePathLocal":  "cs336_basics/train_model.py",
+  "git":  {
+    "remote":  "https://github.com/stanford-cs336/assignment1-basics.git",
+    "commit":  "430e2c844e29f8aad8f9330e8706db9cb508241f"
+  },
+  "email":  "reuterchris05@gmail.com",
+  "root":  "/Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics",
+  "host":  "CVH6FWYQJ5",
+  "executable":  "/Users/I749950/Downloads/Vorlesungen/Zusatz /CS336/assignment1-basics/.venv/bin/python",
+  "writerId":  "6cmxd6dy2x2dehs5rpa4l53s3awnsvrl"
+}
