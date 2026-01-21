@@ -426,7 +426,7 @@ class BPETokenizer:
         print(f"Starting tokenization of {file_path}")
 
         print(
-            f"Tokenization will take about {file_size/tokenizer_throughput/3600:.2f} hours")
+            f"Tokenization will take about {file_size/tokenizer_throughput/3600/num_workers:.2f} hours")
 
         # Get chunk boundaries from file
         with open(file_path, "rb") as f:
@@ -440,7 +440,7 @@ class BPETokenizer:
 
         with open(temp_path, "wb") as out:
             with Pool(num_workers) as pool:
-                for tokens in tqdm(pool.imap(self._encode_chunk, chunk_args)):
+                for tokens in tqdm(pool.imap(self._encode_chunk, chunk_args), total=len(chunk_args)):
                     tokens.tofile(out)
 
         # uint16 means 2 byte per token

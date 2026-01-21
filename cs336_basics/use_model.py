@@ -4,7 +4,7 @@ from cs336_basics.model import Transformer
 
 
 tokenizer = BPETokenizer()
-tokenizer.load("checkpoints/tokenizer_tiny_stories.model")
+tokenizer.load("checkpoints/tokenizer_owt.model")
 
-decode("checkpoints/model.v2", tokenizer,
-       "Once upon a time", 256, 0.9, 0.9)
+decode("checkpoints/model_owt.v1", tokenizer,
+       "What is the meaning of life?", 256, 0.9, 0.9)

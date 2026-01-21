@@ -228,9 +228,6 @@ def load_checkpoint(
         model: torch.nn.Module = None,
         optimizers: tuple[torch.optim.Optimizer] = None) -> tuple[int, typing.Any, typing.Optional[dict]]:
 
-    if not isinstance(optimizers, (tuple, list)):
-        optimizers = (optimizers,)
-
     if src is None or not os.path.exists(src):
         print("No model to load - starting from scratch")
         return (0, None, None)
@@ -241,6 +238,8 @@ def load_checkpoint(
     if model is not None:
         model.load_state_dict(checkpoint["model"])
     if optimizers is not None:
+        if not isinstance(optimizers, (tuple, list)):
+            optimizers = (optimizers,)
         for i, optimizer in enumerate(optimizers):
             optimizer.load_state_dict(checkpoint[f"optimizer_{i}"])
 

@@ -2,11 +2,11 @@ from cs336_basics.train import train_together
 import wandb
 
 
-train_path = "../data/TinyStoriesV2-GPT4-train.npy"
-valid_path = "../data/TinyStoriesV2-GPT4-valid.npy"
-save_path = "checkpoints/model.v3"
-load_path = "checkpoints/model.v3"
-tokenizer_path = "checkpoints/tokenizer_tiny_stories.model"
+train_path = "../data/owt_train.npy"
+valid_path = "../data/owt_valid.npy"
+save_path = "checkpoints/model_owt.v1"
+load_path = "checkpoints/model_owt.v1"
+tokenizer_path = "checkpoints/tokenizer_owt.model"
 
 
 def run_lr_sweep():

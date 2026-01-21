@@ -101,9 +101,10 @@ def sample_document(file_path, n=1):
 #     "../data/TinyStoriesV2-GPT4-train.txt", "../data/TinyStoriesV2-GPT4-train.npy")
 
 
-tokenizer = BPETokenizer()
-tokenizer.load("checkpoints/tokenizer_owt.model")
-tokenizer.tokenize_and_save(
-    "../data/owt_valid.txt", "../data/owt_valid.npy")
-tokenizer.tokenize_and_save(
-    "../data/owt_train.txt", "../data/owt_train.npy")
+if __name__ == '__main__':
+    tokenizer = BPETokenizer()
+    tokenizer.load("checkpoints/tokenizer_owt.model")
+    tokenizer.tokenize_and_save(
+        "../data/owt_valid.txt", "../data/owt_valid.npy")
+    tokenizer.tokenize_and_save(
+        "../data/owt_train.txt", "../data/owt_train.npy")

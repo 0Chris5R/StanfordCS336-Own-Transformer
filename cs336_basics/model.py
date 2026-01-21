@@ -594,8 +594,8 @@ class Transformer(nn.Module):
 #                           6400, 1, None, None, torch.float32)
 
 # for reasonably sized local model:
-# transformer = Transformer(50257, 1024, 768, 12, 6,
-#                           3072, 10000, None, None, torch.float32)
+# transformer = Transformer(10000, 256, 512, 4, 16, 1344,
+#                           10000, None, None, torch.float32, True, True)
 
 
 # transformer.get_parameters(verbose=True)
