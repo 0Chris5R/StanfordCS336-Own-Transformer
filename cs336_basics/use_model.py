@@ -1,5 +1,6 @@
 from cs336_basics.train import decode
 from cs336_basics.tokenizer import BPETokenizer
+from cs336_basics.model import Transformer
 
 
 tokenizer = BPETokenizer()

@@ -71,7 +71,7 @@ class AdamW(torch.optim.Optimizer):
                 # cautious weight decay: only applies weight decay for parameters where update direction and weights align
                 if self.cautious_weight_decay is True:
 
-                    p.add_(p * (p * update >= 0), alpha=-lr*lam)
+                    p.add_(p * ((p * update) >= 0).float(), alpha=-lr*lam)
 
                 # normal decoupled weigth decay:
                 else:
@@ -82,6 +82,78 @@ class AdamW(torch.optim.Optimizer):
                 state["step"] += 1
 
         return loss
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr, weight_decay, mu=0.95,  cautious_weight_decay=False):
+        self.cautious_weight_decay = cautious_weight_decay
+        defaults = {"lr": lr, "lam": weight_decay, "mu": mu}
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            lam = group["lam"]
+            mu = group["mu"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["momentum"] = torch.zeros_like(p)
+                    state["step"] = 1
+
+                m = state["momentum"]
+
+                grad = p.grad.data
+
+                m.mul_(mu)
+                m.add_(grad)
+
+                # Nesterov with lookahead:
+                m_temp = m * mu + grad
+                update = (self._newton_schulz(m_temp))
+
+                # scale the RMS of Muon to the same range of ADAMW (empirically 0.2 to 0.4) this way we can use the lr and weight_decay from ADAMW
+                step_size = 0.2 * \
+                    math.sqrt(max(m.size(0), m.size(1))) * lr
+
+                # cautious weight decay: only applies weight decay for parameters where update direction and weights align
+                if self.cautious_weight_decay is True:
+
+                    p.add_(p * ((p * update) >= 0).float(), alpha=-lr*lam)
+
+                # normal decoupled weigth decay:
+                else:
+                    p.mul_(1 - lr * lam)
+
+                p.add_(update, alpha=-step_size)
+
+        return loss
+
+    @torch.no_grad()
+    def _newton_schulz(self, g: torch.tensor, steps=5, eps=1e-7):
+        x = g / (torch.linalg.norm(g, 'fro')+eps)
+        a_cof, b_cof, c_cof = 3.4445, -4.7750, 2.0315
+        if g.size(0) > g.size(1):
+            x = x.T
+        # newton Schulz Formula: a*X + b*(X@X.T)@X + c*(X@X.T)**2 @ X
+        for _ in range(steps):
+            a = x @ x.T
+            b = b_cof * a + c_cof * a @ a
+            x = a_cof * x + b @ x
+
+        if g.size(0) > g.size(1):
+            x = x.T
+
+        return x
 
 
 def lr_scheduler(t, max_learning_rate: float,
@@ -137,18 +209,27 @@ def get_batch(dataset: np.ndarray | str, batch_size: int, context_length: int, d
 
 
 def save_checkpoint(model: torch.nn.Module,
-                    optimizer: torch.optim.Optimizer,
+                    optimizers: tuple[torch.optim.Optimizer],
                     iteration: int,
                     out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes], run_id=None, model_config=None) -> None:
 
+    if not isinstance(optimizers, (tuple, list)):
+        optimizers = (optimizers,)
+
+    optim_state_dict = {f"optimizer_{i}": opt.state_dict()
+                        for i, opt in enumerate(optimizers)}
+
     torch.save({"model": model.state_dict(),
-               "optimizer": optimizer.state_dict(), "iteration": iteration, "run_id": run_id, "model_config": model_config}, out)
+               **optim_state_dict, "iteration": iteration, "run_id": run_id, "model_config": model_config}, out)
 
 
 def load_checkpoint(
         src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
         model: torch.nn.Module = None,
-        optimizer: torch.optim.Optimizer = None) -> tuple[int, typing.Any, typing.Optional[dict]]:
+        optimizers: tuple[torch.optim.Optimizer] = None) -> tuple[int, typing.Any, typing.Optional[dict]]:
+
+    if not isinstance(optimizers, (tuple, list)):
+        optimizers = (optimizers,)
 
     if src is None or not os.path.exists(src):
         print("No model to load - starting from scratch")
@@ -159,8 +240,9 @@ def load_checkpoint(
                            v in checkpoint["model"].items()}
     if model is not None:
         model.load_state_dict(checkpoint["model"])
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint["optimizer"])
+    if optimizers is not None:
+        for i, optimizer in enumerate(optimizers):
+            optimizer.load_state_dict(checkpoint[f"optimizer_{i}"])
 
     print(f"Successfully loaded previous model checkpoint from {src}")
 
@@ -190,7 +272,8 @@ def train_together(
     betas: tuple[float, float] = (0.9, 0.95),
     norm=True,
     rope=True,
-    cautious_weight_decay=False
+    cautious_weight_decay=False,
+    use_muon=False
 
 ) -> None:
 
@@ -201,14 +284,33 @@ def train_together(
     model = Transformer(vocab_size, context_length, d_model, num_layers,
                         num_heads, d_ff, rope_theta, None, device, dtype, norm=norm, rope=rope)
 
-    optimizer = AdamW(model.parameters(), min_learning_rate,
-                      weight_decay, betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
+    if use_muon:
+        muon_params = []
+        adamw_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Apply Muon only to weight matrices (2D tensors) in Linear layers
+            if len(param.shape) == 2 and name not in ("output.W", "embedding.E"):
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+        muon = Muon(muon_params, min_learning_rate, weight_decay,
+                    betas[1], cautious_weight_decay)
+        adamw = AdamW(adamw_params, min_learning_rate, weight_decay,
+                      betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
+        optimizers = (muon, adamw)
+    else:
+        optimizer = AdamW(model.parameters(), min_learning_rate,
+                          weight_decay, betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
+        optimizers = (optimizer,)
 
     tokenizer = BPETokenizer()
     tokenizer.load(tokenizer_path)
 
     iteration, run_id, model_config = load_checkpoint(
-        load_model_path, model, optimizer)
+        load_model_path, model, optimizers)
 
     if model_config is None:
         model_config = {"vocab_size": vocab_size, "context_length": context_length, "d_model": d_model, "num_layers": num_layers,
@@ -216,7 +318,8 @@ def train_together(
 
     print("Starting training")
     num_parameters = model.get_parameters(verbose=True)
-    model.get_training_memory(verbose=True, batch_size=batch_size)
+    model.get_training_memory(
+        verbose=True, batch_size=batch_size, use_muon=use_muon)
     model.get_training_time(verbose=True, steps=steps, batch_size=batch_size)
     print(f"Training on {model.device}")
 
@@ -231,9 +334,10 @@ def train_together(
         config={
             "max_lr": max_learning_rate,
             "batch_size": batch_size,
-            "optimizer": "adamw",
             "model parameters in Million": round(num_parameters/1e6, 2),
             "steps": steps,
+            "total_tokens": steps*batch_size*context_length,
+            "optimizer": "muon" if use_muon else "adam"
         }
     )
 
@@ -246,10 +350,11 @@ def train_together(
         lr = lr_scheduler(step, max_learning_rate,
                           min_learning_rate, warmup_iters, cosine_cycle_iters)
 
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        for optimizer in optimizers:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-        loss = train_step(model, optimizer, train_path,
+        loss = train_step(model, optimizers, train_path,
                           batch_size, context_length, device, max_l2_norm, norm=norm)
 
         if step % 10 == 0:
@@ -280,7 +385,7 @@ def train_together(
                 best_val_loss = val_loss
 
                 if step % 1000 == 0 and save_model_path is not None:
-                    save_checkpoint(model, optimizer, step,
+                    save_checkpoint(model, optimizers, step,
                                     save_model_path, run_id, model_config)
 
                     print(
@@ -291,7 +396,7 @@ def train_together(
     wandb.finish()
 
 
-def train_step(model, optimizer, train_path, batch_size, context_length, device, max_l2_norm, norm=True) -> float:
+def train_step(model, optimizers: tuple, train_path, batch_size, context_length, device, max_l2_norm, norm=True) -> float:
 
     inputs, targets = get_batch(
         dataset=train_path, batch_size=batch_size, context_length=context_length, device=device)
@@ -302,13 +407,15 @@ def train_step(model, optimizer, train_path, batch_size, context_length, device,
         logits.view(-1, logits.size(-1)),
         targets.view(-1))
 
-    optimizer.zero_grad()
+    for optimizer in optimizers:
+        optimizer.zero_grad()
 
     loss.backward()
 
     gradient_clipping(model.parameters(), max_l2_norm)
 
-    optimizer.step()
+    for optimizer in optimizers:
+        optimizer.step()
 
     return loss.item()
 

@@ -387,7 +387,21 @@ class Transformer(nn.Module):
                 f"Output Projection: {flops_output*100/flops:.2f} % of FLOPS")
         return flops
 
-    def get_parameters(self, verbose=False):
+    def get_parameters(self, verbose=False, use_muon=False):
+        if use_muon:
+            muon_params = 0
+            adamw_params = 0
+            for name, p in self.named_parameters():
+                if not p.requires_grad:
+                    continue
+
+                if len(p.shape) == 2 and name not in ("output.W", "embedding.E"):
+                    muon_params += p.numel()
+                else:
+                    adamw_params += p.numel()
+
+            return (muon_params, adamw_params)
+
         parameters = sum(p.numel() for p in self.parameters())
         if verbose:
             print(
@@ -395,40 +409,104 @@ class Transformer(nn.Module):
         return parameters
 
     def get_activation_size(self, verbose=False):
+        """
+        Activation memory for training: what autograd saves for backward pass.
+        Reference: https://blog.eleuther.ai/transformer-math/
+        """
+        bytes_per_elem = torch.tensor([], dtype=self.dtype).element_size()
+        T = self.context_length
+        d = self.d_model
+        d_ff = self.d_ff
+        L = self.num_layers
+        n_heads = self.num_heads
+        V = self.vocab_size
 
-        memory = 0
+        # Attention block
+        # 1. RMSNorm:
+        attn_norm_input = T * d
+        # 2. QKV projection:
+        qkv_input = T * d
+        # 3. Q, K matrices
+        qk_matrices = 2 * T * d
+        # 4. Attention scores:
+        attn_scores = n_heads * T * T
+        # 5. Softmax output
+        softmax_out = n_heads * T * T
+        # 6. V matrix
+        v_matrix = T * d
+        # 7. Attention output before projection
+        attn_out = T * d
+        # 8. Output projection input
+        out_proj_input = T * d
 
-        # 2. RMSNorm: no matmuls (context_len, d_model)
-        memory += self.context_length * self.d_model
-        # 3. FFN:
-        # x @ W1, x @ W3 -> (context_len, d_ff), y @ W2 -> (context_len, d_model)
-        memory += self.context_length * self.d_ff * \
-            2 + self.context_length * self.d_model
-        # 4. MHA:
-        # 4.1 Projections: xWq, xWk, xWv, xWO (assuming d_k = d_V = d_model)
-        memory += self.context_length * self.d_model * 4
-        # 4.2 Attention calculations
-        # scores:
-        memory += self.context_length ** 2
-        # scores @ V
-        memory += self.context_length * self.d_model
-        # Multiply by number of layers
-        memory *= self.num_layers
+        attn_per_layer = (attn_norm_input + qkv_input + qk_matrices +
+                          attn_scores + softmax_out + v_matrix +
+                          attn_out + out_proj_input)
 
-        # 1. Embedding Layer: (context_len, d_model)
-        memory += self.context_length * self.d_model
-        # 5. Output Projection + final RMS norm:
-        memory += self.context_length * self.d_model + \
-            self.context_length * self.vocab_size
-        memory *= torch.tensor([], dtype=self.dtype).element_size()
+        # ffn(swiglu)
+        # 1. RMSNormt
+        ffn_norm_input = T * d
+        # 2. FFN input
+        ffn_input = T * d
+        # 3. W1 @ x
+        w1x = T * d_ff
+        # 4. W3 @ x
+        w3x = T * d_ff
+        # 5. silu intermediate
+        silu_intermediate = T * d_ff
+        # 6. silu * w3x
+        ffn_hidden = T * d_ff
+
+        ffn_per_layer = (ffn_norm_input + ffn_input + w1x + w3x +
+                         silu_intermediate + ffn_hidden)
+
+        # residual connections
+        residual_per_layer = 2 * T * d
+        per_layer_total = attn_per_layer + ffn_per_layer + residual_per_layer
+        # for all layers:
+        memory = per_layer_total * L
+
+        # only once:
+        # 1. embedding
+        memory += T * d
+        # 2. Final RMSNorm
+        memory += T * d
+        # 3. Output projection
+        memory += T * d
+        # 4. Logits
+        memory += T * V
+
+        # Convert to bytes
+        memory *= bytes_per_elem
 
         if verbose:
+            print("Activation memory(batch_size=1):")
             print(
-                f"The model activations consume a total memory of {memory/(1024**3):.2f} GB ")
+                f"  Per layer: {per_layer_total * bytes_per_elem / 1e6:.2f} MB")
+            print(
+                f"    Attention: {attn_per_layer * bytes_per_elem / 1e6:.2f} MB")
+            print(f"    FFN: {ffn_per_layer * bytes_per_elem / 1e6:.2f} MB")
+            print(
+                f"    Residuals: {residual_per_layer * bytes_per_elem / 1e6:.2f} MB")
+            print(
+                f"  All {L} layers: {per_layer_total * L * bytes_per_elem / 1e6:.2f} MB")
+            print(
+                f"  Output/embedding: {(3*T*d + T*V) * bytes_per_elem / 1e6:.2f} MB")
+            print(f"Total activations (batch=1): {memory / (1024**3):.3f} GB")
 
         return memory
 
-    def get_memory(self, verbose=False):
+    def get_memory(self, verbose=False, use_muon=False):
+        if use_muon:
+
+            parameters_muon, parameters_adamw = self.get_parameters(
+                verbose=False, use_muon=use_muon)
+            memory_muon = parameters_muon * \
+                torch.tensor([], dtype=self.dtype).element_size()
+            memory_adamw = parameters_adamw * \
+                torch.tensor([], dtype=self.dtype).element_size()
+
+            return memory_muon, memory_adamw
         parameters = self.get_parameters()
         memory = parameters * torch.tensor([], dtype=self.dtype).element_size()
         if verbose:
@@ -445,15 +523,40 @@ class Transformer(nn.Module):
                 f"Training the model takes a total of {flops/1e9:.2f} GFLOPS per batch per step")
         return flops
 
-    def get_training_memory(self, verbose=False, batch_size=1):
+    def get_training_memory(self, verbose=False, batch_size=1, use_muon=False):
+        """
+        Total memory for training including activations, weights, gradients, and optimizer states.
+        Including empirical overhead factors for memory fragmentation and torch.compile.
+        """
+        # Memory fragmentation overhead from pytorch allocator
+        FRAGMENTATION_FACTOR = 1.3
 
-        memory = self.get_activation_size() * batch_size + self.get_memory() * 4
+        activation_mem = self.get_activation_size() * batch_size
+        model_mem = self.get_memory()
+
+        if use_muon:
+            memory_muon, memory_adamw = self.get_memory(
+                verbose=False, use_muon=use_muon)
+
+            # the optimizer needs gradients + momentum for muon (+ velocity) for adamw
+            optimizer_mem = memory_muon * 2 + memory_adamw * 3
+            base_memory = activation_mem + model_mem + optimizer_mem
+        else:
+            optimizer_mem = model_mem * 3
+            base_memory = activation_mem + optimizer_mem
+
+        total_memory = base_memory * FRAGMENTATION_FACTOR
 
         if verbose:
+            opt_name = "Muon + AdamW" if use_muon else "AdamW"
+            print(f"Training memory breakdown ({opt_name}):")
+            print(f"  Model weights: {model_mem / 1e9:.3f} GB")
             print(
-                f"Training the model with ADAMW as optimizer consumes a total memory of {memory/(1024**3):.2f} GB")
+                f"  Activations (batch={batch_size}): {activation_mem / 1e9:.3f} GB")
+            print(f"  Optimizer states: {optimizer_mem / 1e9:.3f} GB")
+            print(f"  Total Memory: {total_memory / 1e9:.3f} GB")
 
-        return memory
+        return total_memory
 
     def get_training_time(self, verbose=False, steps=None, batch_size=None):
 
