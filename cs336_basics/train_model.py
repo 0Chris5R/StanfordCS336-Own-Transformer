@@ -4,8 +4,8 @@ import wandb
 
 train_path = "../data/TinyStoriesV2-GPT4-train.npy"
 valid_path = "../data/TinyStoriesV2-GPT4-valid.npy"
-save_path = "checkpoints/model.v1"
-load_path = "checkpoints/model.v1"
+save_path = "checkpoints/model.v2"
+load_path = "checkpoints/model.v2"
 tokenizer_path = "checkpoints/tokenizer_tiny_stories.model"
 
 
@@ -126,4 +126,4 @@ if __name__ == "__main__":
     # actual training run:
 
     train_together(train_path=train_path, val_path=valid_path,
-                   save_model_path=save_path, tokenizer_path=tokenizer_path, load_model_path=load_path, steps=85000, batch_size=8, max_learning_rate=compute_lr(8), betas=(0.9, compute_beta2(8)), cautious_weight_decay=True)
+                   save_model_path=save_path, tokenizer_path=tokenizer_path, load_model_path=load_path, steps=20000, batch_size=32, max_learning_rate=compute_lr(32), betas=(0.9, compute_beta2(32)), cautious_weight_decay=True)

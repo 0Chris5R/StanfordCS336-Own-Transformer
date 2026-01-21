@@ -6,6 +6,7 @@ from collections import defaultdict
 from tqdm import tqdm
 import time
 import numpy as np
+from numpy.lib.format import open_memmap
 
 
 class BPETokenizer:
@@ -152,6 +153,13 @@ class BPETokenizer:
 
         return ids
 
+    def _encode_chunk(self, args):
+        start, end, file_path = args
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            chunk_text = f.read(end - start).decode("utf-8", errors="ignore")
+        return np.array(self.encode(chunk_text), dtype=np.uint16)
+
     def encode_iterable(self, iterable):
         for line in iterable:
             for token_id in self.encode(line):
@@ -223,11 +231,19 @@ class BPETokenizer:
         # The corpus is chunked at special token boundaries so chunks can be processed independently.
         # Results are stored in memory as a list of lists of token IDs.
 
-        # Get chunk boundaries from file
+        # We need to make sure we dont read the entire file into memory if it is too big to fit into RAM.
+        # A reasonable amount to read into memory 2GB ?
         num_workers = max(1, cpu_count()-4)
+        max_memory = 2 * 1024**3
+        max_chunk_size = max_memory//num_workers
+        file_size = os.path.getsize(input_path)
+        num_chunks = max(num_workers, file_size//max_chunk_size + 1)
+
+        # Get chunk boundaries from file
+
         with open(input_path, "rb") as f:
             boundaries = self.find_chunk_boundaries(
-                f, num_workers, split_token_bytes)
+                f, num_chunks, split_token_bytes)
 
         # Build list of (start, end, filepath) tuples for parallel workers
         chunk_args = [
@@ -397,20 +413,51 @@ class BPETokenizer:
 
     def tokenize_and_save(self, file_path: str, output_path: str):
 
-        with open(file_path, "r", encoding="utf-8") as f:
+        split_token = self.special_tokens[0] if self.special_tokens else "\n"
+        split_token_bytes = split_token.encode("utf-8")
+        num_workers = max(1, cpu_count()-4)
+        max_memory = 2 * 1024**3
+        max_chunk_size = max_memory//num_workers
+        file_size = os.path.getsize(file_path)
+        num_chunks = max(num_workers, file_size//max_chunk_size + 1)
 
-            # approximate throughput in bytes/second
-            tokenizer_throughput = 1373880.86
-            byte_size = os.path.getsize(file_path)
+        tokenizer_throughput = 1373880.86
 
-            print(f"Starting tokenization of {file_path}")
+        print(f"Starting tokenization of {file_path}")
 
-            print(
-                f"Tokenization will take about {byte_size/tokenizer_throughput/3600:.2f} hours")
+        print(
+            f"Tokenization will take about {file_size/tokenizer_throughput/3600:.2f} hours")
 
-            text = f.read()
-            tokenizer_data = np.array(self.encode(
-                text, verbose=True), dtype=np.uint16)
-            np.save(output_path, tokenizer_data)
+        # Get chunk boundaries from file
+        with open(file_path, "rb") as f:
+            boundaries = self.find_chunk_boundaries(
+                f, num_chunks, split_token_bytes)
 
+        chunk_args = [(s, e, file_path)
+                      for s, e in zip(boundaries[:-1], boundaries[1:])]
+
+        temp_path = output_path + ".tmp"
+
+        with open(temp_path, "wb") as out:
+            with Pool(num_workers) as pool:
+                for tokens in tqdm(pool.imap(self._encode_chunk, chunk_args)):
+                    tokens.tofile(out)
+
+        # uint16 means 2 byte per token
+        num_tokens = os.path.getsize(temp_path) // 2
+
+        final = open_memmap(
+            output_path,
+            mode="w+",
+            dtype=np.uint16,
+            shape=(num_tokens,)
+        )
+
+        raw = np.memmap(temp_path, dtype=np.uint16,
+                        mode="r", shape=(num_tokens,))
+        # page wise copy that avoid materializing the entire file into RAM
+        final[:] = raw[:]
+        final.flush()
+        del raw, final
+        os.remove(temp_path)
         print(f"Converted dataset to tokens and saved to {output_path}")
