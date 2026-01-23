@@ -472,6 +472,8 @@ def decode(model_path, tokenizer, x, num_tokens, temperature=1, top_p_threshold=
     else:
         model = model_path
 
+    print(x, end="", flush=True)
+
     # our model takes tensor(batch, seq) as input
     x = torch.tensor(tokenizer.encode(x), device=model.device).unsqueeze(0)
 

@@ -568,8 +568,9 @@ class Transformer(nn.Module):
 
         if steps is None:
             # Assuming Chinchillas Law (we want to train on roughly 20 * parameters tokens).
+            # More recent papers tend towards 8-9x scaling law
 
-            tokens = 20 * self.get_parameters()
+            tokens = 8 * self.get_parameters()
 
             # For a given context length we can fit len(context_window) tokens per step
             steps = tokens/self.context_length
@@ -594,7 +595,7 @@ class Transformer(nn.Module):
 #                           6400, 1, None, None, torch.float32)
 
 # for reasonably sized local model:
-# transformer = Transformer(10000, 256, 512, 4, 16, 1344,
+# transformer = Transformer(32000, 512, 768, 12, 12, 2048,
 #                           10000, None, None, torch.float32, True, True)
 
 
@@ -603,5 +604,5 @@ class Transformer(nn.Module):
 # transformer.get_flops(verbose=True)
 # transformer.get_activation_size(verbose=True)
 # transformer.get_training_flops(verbose=True)
-# transformer.get_training_memory(verbose=True, batch_size=32)
+# transformer.get_training_memory(verbose=True, batch_size=32, use_muon=True)
 # transformer.get_training_time(verbose=True)

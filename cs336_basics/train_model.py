@@ -4,36 +4,39 @@ import wandb
 
 train_path = "../data/owt_train.npy"
 valid_path = "../data/owt_valid.npy"
-save_path = "checkpoints/model_owt.v1"
-load_path = "checkpoints/model_owt.v1"
+save_path = "checkpoints/model_owt.v3"
+load_path = "checkpoints/model_owt.v3"
 tokenizer_path = "checkpoints/tokenizer_owt.model"
 
 
 def run_lr_sweep():
     """Sweep over learning rates to find edge of stability."""
     sweep_config = {
-        "method": "random",
+        "method": "grid",
         "metric": {"name": "val/loss", "goal": "minimize"},
         "parameters": {
-            # Log-uniform from 1e-5 to 5e-2 (some will diverge)
-            "max_learning_rate": {"distribution": "log_uniform_values", "min": 1e-5, "max": 5e-2}
+            "max_learning_rate": {"values": [3e-4, 6e-4, 1e-3, 2e-3, 4e-3, 8e-3, 1.5e-2]}
         }
     }
 
     def train_fn():
         wandb.init()
         train_together(
-            train_path=train_path,
-            val_path=valid_path,
-            save_model_path=None,
-            tokenizer_path=tokenizer_path,
+            d_model=640, num_layers=6, num_heads=20, d_ff=1728,
+            vocab_size=32000, context_length=256,
+            train_path=train_path, val_path=valid_path,
+            save_model_path=None, tokenizer_path=tokenizer_path,
             load_model_path=None,
+            steps=250,
+            batch_size=64,
             max_learning_rate=wandb.config.max_learning_rate,
-            steps=2500
+            betas=(0.9, compute_beta2(64)),
+            cautious_weight_decay=True,
+            use_muon=True
         )
 
     sweep_id = wandb.sweep(sweep_config, project="Transformer-LR-Sweep")
-    wandb.agent(sweep_id, train_fn, count=20)
+    wandb.agent(sweep_id, train_fn, count=7)
 
 
 # optimal values found by the lr sweep
@@ -125,5 +128,5 @@ if __name__ == "__main__":
     #                tokenizer_path=tokenizer_path, steps=2500, batch_size=32, max_learning_rate=compute_lr(32), betas=(0.9, compute_beta2(32)))
     # actual training run:
 
-    train_together(train_path=train_path, val_path=valid_path,
-                   save_model_path=save_path, tokenizer_path=tokenizer_path, load_model_path=load_path, steps=2500, batch_size=32, max_learning_rate=compute_lr(32), betas=(0.9, compute_beta2(32)), cautious_weight_decay=True, use_muon=True)
+    train_together(d_model=640, num_layers=6, num_heads=20, d_ff=1728, vocab_size=32000, context_length=256, train_path=train_path, val_path=valid_path,
+                   save_model_path=save_path, tokenizer_path=tokenizer_path, load_model_path=load_path, steps=10000, batch_size=64, max_learning_rate=1e-3, betas=(0.9, compute_beta2(64)), cautious_weight_decay=True, use_muon=True)
