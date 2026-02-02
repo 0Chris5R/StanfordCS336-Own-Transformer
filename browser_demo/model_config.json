@@ -1,0 +1,7 @@
+{
+  "vocab_size": 32000,
+  "context_length": 256,
+  "d_model": 640,
+  "num_layers": 6,
+  "num_heads": 20
+}

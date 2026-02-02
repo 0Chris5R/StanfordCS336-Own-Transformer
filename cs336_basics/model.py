@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-from einops import einsum, rearrange
 
 
 class Linear(nn.Module):
@@ -17,7 +16,7 @@ class Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
-        return einsum(x, self.W, "... d_in, d_out d_in -> ... d_out")
+        return x @ self.W.transpose(-1, -2)
 
 
 class Embedding(nn.Module):
@@ -80,11 +79,10 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
-        w1x = einsum(self.W1, x, "d_ff d_model, ... d_model -> ... d_ff")
-        w3x = einsum(self.W3, x, "d_ff d_model, ... d_model -> ... d_ff")
+        w1x = x @ self.W1.transpose(-1, -2)
+        w3x = x @ self.W3.transpose(-1, -2)
         silu = w1x * self.sigmoid(w1x)
-
-        return einsum(self.W2, silu * w3x, "d_model d_ff, ... d_ff -> ... d_model")
+        return (silu * w3x) @ self.W2.transpose(-1, -2)
 
     def sigmoid(self, x: torch.Tensor) -> torch.Tensor:
 
@@ -109,25 +107,25 @@ class RoPE(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None) -> torch.Tensor:
 
         # fetch buffered rope for idx token_positions and handle batching over n_heads:
 
-        if token_positions is None:
-            token_positions = torch.arange(
-                x.shape[-2], device=x.device, dtype=x.dtype)
-        cos = self.cos[..., token_positions, :]
-        sin = self.sin[..., token_positions, :]
+        seq_len = x.shape[-2]
+        cos = self.cos[:, :, :seq_len, :]
+        sin = self.sin[:, :, :seq_len, :]
+
+        # Handle both 3D (batch, seq, d) and 4D (batch, heads, seq, d) inputs
+        if x.dim() == 3:
+            cos = cos.squeeze(0).squeeze(0)
+            sin = sin.squeeze(0).squeeze(0)
 
         x_even = x[..., 0::2]
         x_odd = x[..., 1::2]
-        x1 = x_even * cos - x_odd * sin
-        x2 = x_even * sin + x_odd * cos
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
 
-        x[..., 0::2] = x1
-        x[..., 1::2] = x2
-
-        return x
+        return torch.stack([x_rot_even, x_rot_odd], dim=-1).flatten(-2)
 
     def precompute_rope(self, seq_len: int, d: int) -> tuple[torch.Tensor]:
 
@@ -161,10 +159,11 @@ def softmax(x: torch.Tensor, d: int = -1, temperature=1) -> torch.Tensor:
 
 class MultiHeadSelfAttention(nn.Module):
 
-    def __init__(self, d_model: int, num_heads: int, rope: nn.Module = None,  device=None, dtype=None):
+    def __init__(self, d_model: int, num_heads: int, rope: nn.Module = None, device=None, dtype=None, max_seq_len: int = 512):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
+        self.d_head = d_model // num_heads
         if rope is not None:
             self.rope = rope
         self.WQ = nn.Parameter(torch.empty(
@@ -186,29 +185,25 @@ class MultiHeadSelfAttention(nn.Module):
         nn.init.trunc_normal_(
             self.WO, mean=0.0, std=sigma, a=-3*sigma, b=3*sigma)
 
+        # precompute causal mask
+        causal_mask = torch.zeros(
+            max_seq_len, max_seq_len, device=device, dtype=dtype)
+        causal_mask.masked_fill_(torch.triu(torch.ones(
+            max_seq_len, max_seq_len, device=device), diagonal=1).bool(), float('-inf'))
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+
     def forward(self, x: torch.Tensor, token_positions: int = None):
 
-        # calculate causal mask:
-
-        mask = torch.tril(torch.ones(
-            x.shape[-2], x.shape[-2], device=x.device), diagonal=0).bool()
+        batch, seq_len, _ = x.shape
 
         # Apply projection matrix and split d_model into n_heads, d_head + move n_heads to the front as batch dimension
 
-        Q = einsum(
-            x, self.WQ, "... seq_len d_model, d_keys d_model -> ... seq_len d_keys")
-        Q = rearrange(
-            Q, "... seq_len (n_heads d_head) -> ... n_heads seq_len d_head", n_heads=self.num_heads)
-
-        K = einsum(
-            x, self.WK, "... seq_len d_model, d_keys d_model -> ... seq_len d_keys")
-        K = rearrange(
-            K, "... seq_len (n_heads d_head) -> ... n_heads seq_len d_head", n_heads=self.num_heads)
-
-        V = einsum(
-            x, self.WV, "... seq_len d_model, d_values d_model -> ... seq_len  d_values")
-        V = rearrange(
-            V, "... seq_len (n_heads d_head) -> ... n_heads seq_len d_head", n_heads=self.num_heads)
+        Q = (x @ self.WQ.T).view(batch, seq_len,
+                                 self.num_heads, self.d_head).transpose(-2, -3)
+        K = (x @ self.WK.T).view(batch, seq_len,
+                                 self.num_heads, self.d_head).transpose(-2, -3)
+        V = (x @ self.WV.T).view(batch, seq_len,
+                                 self.num_heads, self.d_head).transpose(-2, -3)
 
         # Apply RoPE
         if hasattr(self, "rope"):
@@ -216,30 +211,32 @@ class MultiHeadSelfAttention(nn.Module):
             K = self.rope.forward(K, token_positions)
 
         # Calculate Attention
-        output = self.scaled_dot_product_attention(Q, K, V, mask=mask)
+        d_k = K.shape[-1]
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(d_k)
+        scores = scores + self.causal_mask[:seq_len, :seq_len]
+        output = softmax(scores) @ V
         # Concatenate heads
-        output = rearrange(
-            output, "... n_heads seq_len d_head -> ... seq_len (n_heads d_head)")
+        output = output.transpose(1, 2).reshape(
+            batch, seq_len, self.d_model)
         # Apply output projection
-        return einsum(output, self.WO, "... seq_len d_V, d_model d_V -> ... seq_len d_model")
+        return output @ self.WO.transpose(-2, -1)
 
     @staticmethod
     def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
 
         d_k = K.shape[-1]
 
-        scores = einsum(
-            Q, K, "... seq_len1 d_k, ... seq_len2 d_k -> ... seq_len1 seq_len2")/math.sqrt(d_k)
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(d_k)
 
         if mask is not None:
             scores = scores.masked_fill(~mask, -float('inf'))
 
-        return einsum(softmax(scores), V, "... seq_len1 seq_len2, ... seq_len2 d_v -> ... seq_len1 d_v")
+        return softmax(scores) @ V
 
 
 class TransformerBlock(nn.Module):
 
-    def __init__(self, d_model: int, d_ff: int, num_heads: int, weights: dict[str, torch.Tensor], rope, device=None, dtype=None, eps=1e-5, norm=True):
+    def __init__(self, d_model: int, d_ff: int, num_heads: int, weights: dict[str, torch.Tensor], rope, device=None, dtype=None, eps=1e-5, norm=True, max_seq_len: int = 512):
 
         super().__init__()
 
@@ -254,7 +251,7 @@ class TransformerBlock(nn.Module):
             self.rmsnorm2 = RMSNorm(d_model, eps, device, dtype)
 
         self.mha = MultiHeadSelfAttention(
-            d_model, num_heads, rope=rope, device=device, dtype=dtype)
+            d_model, num_heads, rope=rope, max_seq_len=max_seq_len, device=device, dtype=dtype)
 
         self.ffn = SwiGLU(d_model, d_ff, device, dtype)
 
@@ -317,7 +314,9 @@ class Transformer(nn.Module):
                 rope=self.rope,
                 device=device,
                 dtype=dtype,
-                eps=1e-5, norm=norm
+                eps=1e-5,
+                norm=norm,
+                max_seq_len=context_length
             )
             for i in range(num_layers)
         ])
