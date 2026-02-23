@@ -1,7 +1,9 @@
 """Training utilities for the CS336 basics assignment."""
 
 import torch
+import torch.nn.functional as F
 import math
+import json
 from typing import Iterable
 import numpy as np
 import os
@@ -272,7 +274,9 @@ def train_together(
     norm=True,
     rope=True,
     cautious_weight_decay=False,
-    use_muon=False
+    use_muon=False,
+    val_interval: int = 250,
+    save_interval: int = 1000,
 
 ) -> None:
 
@@ -295,13 +299,13 @@ def train_together(
                 muon_params.append(param)
             else:
                 adamw_params.append(param)
-        muon = Muon(muon_params, min_learning_rate, weight_decay,
+        muon = Muon(muon_params, max_learning_rate, weight_decay,
                     betas[1], cautious_weight_decay)
-        adamw = AdamW(adamw_params, min_learning_rate, weight_decay,
+        adamw = AdamW(adamw_params, max_learning_rate, weight_decay,
                       betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
         optimizers = (muon, adamw)
     else:
-        optimizer = AdamW(model.parameters(), min_learning_rate,
+        optimizer = AdamW(model.parameters(), max_learning_rate,
                           weight_decay, betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
         optimizers = (optimizer,)
 
@@ -323,7 +327,8 @@ def train_together(
     print(f"Training on {model.device}")
 
     print("Compiling model")
-    model = torch.compile(model, backend="aot_eager")
+    if device.type == "cuda":
+        model = torch.compile(model)
 
     wandb.init(
         project="Transformer-from-scratch",
@@ -371,7 +376,7 @@ def train_together(
 
             }, step=step)
 
-        if step % 250 == 0:
+        if step % val_interval == 0:
             val_loss = val_step(model, val_path, batch_size,
                                 context_length, device, norm=norm)
 
@@ -380,17 +385,16 @@ def train_together(
                 "val/perplexity": math.exp(val_loss),
             }, step=step)
 
-            if val_loss < best_val_loss:
+            # Only compare against best_val_loss at save_interval steps
+            if step % save_interval == 0 and save_model_path is not None and val_loss < best_val_loss:
                 best_val_loss = val_loss
+                save_checkpoint(model, optimizers, step,
+                                save_model_path, run_id, model_config)
 
-                if step % 1000 == 0 and save_model_path is not None:
-                    save_checkpoint(model, optimizers, step,
-                                    save_model_path, run_id, model_config)
-
-                    print(
-                        "Sampling a model generation to see current performance - Once upon a time: ...")
-                    decode(model, tokenizer=tokenizer,
-                           x="Once upon a time", num_tokens=20, temperature=0.8, top_p_threshold=0.9, norm=norm)
+                print(
+                    "Sampling a model generation to see current performance - Once upon a time: ...")
+                decode(model, tokenizer=tokenizer,
+                       x="Once upon a time", num_tokens=20, temperature=0.8, top_p_threshold=0.9, norm=norm)
 
     wandb.finish()
 
