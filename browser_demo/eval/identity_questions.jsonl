@@ -1,0 +1,5 @@
+{"question": "What is your name?", "expected_contains": ["name"], "type": "identity"}
+{"question": "Who are you?", "expected_contains": ["name"], "type": "identity"}
+{"question": "What do you do?", "expected_contains": ["role", "work"], "type": "identity"}
+{"question": "Tell me about yourself.", "expected_contains": ["name"], "type": "identity"}
+{"question": "Where are you based?", "expected_contains": ["location"], "type": "identity"}

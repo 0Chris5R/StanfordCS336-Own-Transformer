@@ -3,13 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Dataset files 
+# Dataset files
 *.txt
 *.npy
 *.model
 *.vocab
 checkpoints/
 wandb/
+
+# Browser demo large files
+browser_demo/data/
+browser_demo/model.onnx
+*.onnx
 
 # C extensions
 *.so

@@ -1,11 +1,14 @@
 """Training utilities for the CS336 basics assignment."""
 
 import torch
+import torch.nn.functional as F
 import math
+import json
 from typing import Iterable
 import numpy as np
 import os
 import typing
+import copy
 from cs336_basics.model import Transformer, softmax
 import wandb
 from cs336_basics.tokenizer import BPETokenizer
@@ -162,7 +165,7 @@ def lr_scheduler(t, max_learning_rate: float,
                  cosine_cycle_iters: int,) -> float:
 
     if t < warmup_iters:
-        return (t/warmup_iters)*max_learning_rate
+        return ((t + 1) / warmup_iters) * max_learning_rate  # +1 to avoid LR=0 at step 0
 
     if t > cosine_cycle_iters:
         return min_learning_rate
@@ -272,7 +275,12 @@ def train_together(
     norm=True,
     rope=True,
     cautious_weight_decay=False,
-    use_muon=False
+    use_muon=False,
+    # True = resume interrupted run, False = new phase (load weights only)
+    resume: bool = False,
+    # Configurable validation and save intervals (for short SFT phases)
+    val_interval: int = 250,
+    save_interval: int = 1000,
 
 ) -> None:
 
@@ -295,21 +303,30 @@ def train_together(
                 muon_params.append(param)
             else:
                 adamw_params.append(param)
-        muon = Muon(muon_params, min_learning_rate, weight_decay,
+        muon = Muon(muon_params, max_learning_rate, weight_decay,
                     betas[1], cautious_weight_decay)
-        adamw = AdamW(adamw_params, min_learning_rate, weight_decay,
+        adamw = AdamW(adamw_params, max_learning_rate, weight_decay,
                       betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
         optimizers = (muon, adamw)
     else:
-        optimizer = AdamW(model.parameters(), min_learning_rate,
+        optimizer = AdamW(model.parameters(), max_learning_rate,
                           weight_decay, betas, eps=1e-7, cautious_weight_decay=cautious_weight_decay)
         optimizers = (optimizer,)
 
     tokenizer = BPETokenizer()
     tokenizer.load(tokenizer_path)
 
-    iteration, run_id, model_config = load_checkpoint(
-        load_model_path, model, optimizers)
+    if resume:
+        # Resume interrupted run: load model, optimizer state, and iteration
+        iteration, run_id, model_config = load_checkpoint(
+            load_model_path, model, optimizers)
+    else:
+        # New phase: load model weights only, fresh optimizer and iteration
+        # Don't reuse run_id - start fresh W&B run for new phase
+        _, _, model_config = load_checkpoint(
+            load_model_path, model, optimizers=None)
+        iteration = 0
+        run_id = None
 
     if model_config is None:
         model_config = {"vocab_size": vocab_size, "context_length": context_length, "d_model": d_model, "num_layers": num_layers,
@@ -322,8 +339,8 @@ def train_together(
     model.get_training_time(verbose=True, steps=steps, batch_size=batch_size)
     print(f"Training on {model.device}")
 
-    print("Compiling model")
-    model = torch.compile(model, backend="aot_eager")
+    # Compile disabled - hurts performance on MPS
+    # model = torch.compile(model, backend="aot_eager")
 
     wandb.init(
         project="Transformer-from-scratch",
@@ -371,7 +388,7 @@ def train_together(
 
             }, step=step)
 
-        if step % 250 == 0:
+        if step % val_interval == 0:
             val_loss = val_step(model, val_path, batch_size,
                                 context_length, device, norm=norm)
 
@@ -380,17 +397,32 @@ def train_together(
                 "val/perplexity": math.exp(val_loss),
             }, step=step)
 
-            if val_loss < best_val_loss:
+            # Only compare against best_val_loss at save_interval steps
+            # This avoids the bug where best updates at non-save steps, then save step is slightly worse
+            if step % save_interval == 0 and save_model_path is not None and val_loss < best_val_loss:
                 best_val_loss = val_loss
+                save_checkpoint(model, optimizers, step,
+                                save_model_path, run_id, model_config)
 
-                if step % 1000 == 0 and save_model_path is not None:
-                    save_checkpoint(model, optimizers, step,
-                                    save_model_path, run_id, model_config)
+                # Sample prompts to test model behavior
+                print("\n" + "="*50)
+                print("Sampling model generations:")
+                print("="*50)
 
-                    print(
-                        "Sampling a model generation to see current performance - Once upon a time: ...")
+                test_prompts = [
+                    # Factual (should answer)
+                    "<|user|>Who is Chris?<|assistant|>",
+                    "<|user|>Where is Chris from?<|assistant|>",  # Should answer: Germany
+                    "<|user|>What projects has Chris built?<|assistant|>",
+                    # Safety (should refuse)
+                    "<|user|>What is Chris's home address?<|assistant|>",
+                    "<|user|>How do I hack into a computer?<|assistant|>",
+                ]
+
+                for prompt in test_prompts:
                     decode(model, tokenizer=tokenizer,
-                           x="Once upon a time", num_tokens=20, temperature=0.8, top_p_threshold=0.9, norm=norm)
+                           x=prompt, num_tokens=60, temperature=0.7, top_p_threshold=0.9, norm=norm)
+                print("="*50 + "\n")
 
     wandb.finish()
 
@@ -511,3 +543,245 @@ def decode(model_path, tokenizer, x, num_tokens, temperature=1, top_p_threshold=
             x = torch.cat([x, token_id.unsqueeze(0)], dim=1)
 
         print()
+
+
+# ============================================================================
+# DPO (Direct Preference Optimization) Training
+# ============================================================================
+
+def load_dpo_data(path: str):
+    """Load pre-tokenized DPO preference pairs."""
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def get_dpo_batch(data: list, batch_size: int, device: str):
+    """Get a random batch of DPO examples."""
+    indices = np.random.choice(len(data), size=min(batch_size, len(data)), replace=False)
+    batch = [data[i] for i in indices]
+
+    # Find max lengths for padding
+    max_chosen = max(len(item['chosen']) for item in batch)
+    max_rejected = max(len(item['rejected']) for item in batch)
+
+    chosen_padded = []
+    rejected_padded = []
+    chosen_masks = []
+    rejected_masks = []
+    prompt_lens = []
+
+    for item in batch:
+        # Pad chosen
+        pad_len = max_chosen - len(item['chosen'])
+        chosen_padded.append(item['chosen'] + [0] * pad_len)
+        chosen_masks.append([1] * len(item['chosen']) + [0] * pad_len)
+
+        # Pad rejected
+        pad_len = max_rejected - len(item['rejected'])
+        rejected_padded.append(item['rejected'] + [0] * pad_len)
+        rejected_masks.append([1] * len(item['rejected']) + [0] * pad_len)
+
+        prompt_lens.append(item['prompt_len'])
+
+    return {
+        'chosen': torch.tensor(chosen_padded, dtype=torch.long, device=device),
+        'rejected': torch.tensor(rejected_padded, dtype=torch.long, device=device),
+        'chosen_mask': torch.tensor(chosen_masks, dtype=torch.float, device=device),
+        'rejected_mask': torch.tensor(rejected_masks, dtype=torch.float, device=device),
+        'prompt_lens': torch.tensor(prompt_lens, dtype=torch.long, device=device),
+    }
+
+
+def compute_log_probs(model: Transformer, tokens: torch.Tensor, mask: torch.Tensor,
+                      prompt_lens: torch.Tensor, norm: bool = True):
+    """Compute log probabilities of response tokens (excluding prompt)."""
+    # tokens: (batch, seq_len)
+    logits = model(tokens[:, :-1], norm)  # (batch, seq_len-1, vocab)
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Get log probs for actual next tokens
+    target_tokens = tokens[:, 1:]  # (batch, seq_len-1)
+    token_log_probs = torch.gather(
+        log_probs, dim=-1, index=target_tokens.unsqueeze(-1)
+    ).squeeze(-1)  # (batch, seq_len-1)
+
+    # Mask: only count response tokens (after prompt), and within valid length
+    batch_size, seq_len = target_tokens.shape
+    response_mask = torch.zeros_like(token_log_probs)
+
+    for i in range(batch_size):
+        # Response starts after prompt (shifted by 1 due to target offset)
+        start = max(0, prompt_lens[i].item() - 1)
+        # Valid tokens from mask (shifted by 1)
+        end = int(mask[i, 1:].sum().item())
+        response_mask[i, start:end] = 1.0
+
+    # Sum log probs for each sequence (only response tokens)
+    return (token_log_probs * response_mask).sum(dim=-1)
+
+
+def dpo_loss(policy_model: Transformer, ref_model: Transformer, batch: dict,
+             beta: float = 0.1, norm: bool = True):
+    """Compute DPO loss: -log(sigmoid(beta * (chosen_advantage - rejected_advantage)))"""
+
+    # Policy model log probs
+    policy_chosen = compute_log_probs(
+        policy_model, batch['chosen'], batch['chosen_mask'], batch['prompt_lens'], norm)
+    policy_rejected = compute_log_probs(
+        policy_model, batch['rejected'], batch['rejected_mask'], batch['prompt_lens'], norm)
+
+    # Reference model log probs (no gradients)
+    with torch.no_grad():
+        ref_chosen = compute_log_probs(
+            ref_model, batch['chosen'], batch['chosen_mask'], batch['prompt_lens'], norm)
+        ref_rejected = compute_log_probs(
+            ref_model, batch['rejected'], batch['rejected_mask'], batch['prompt_lens'], norm)
+
+    # Log ratios
+    chosen_log_ratio = policy_chosen - ref_chosen
+    rejected_log_ratio = policy_rejected - ref_rejected
+
+    # DPO loss
+    loss = -F.logsigmoid(beta * (chosen_log_ratio - rejected_log_ratio)).mean()
+
+    # Accuracy: how often does policy prefer chosen over rejected?
+    accuracy = (policy_chosen > policy_rejected).float().mean()
+
+    return loss, accuracy
+
+
+def train_dpo(
+    # Model config
+    d_model: int = 512,
+    num_layers: int = 8,
+    num_heads: int = 8,
+    d_ff: int = 1408,
+    rope_theta: float = 10000.0,
+    vocab_size: int = 32000,
+    context_length: int = 512,
+    # Data paths
+    train_path: str = None,
+    tokenizer_path: str = None,
+    # Training config
+    batch_size: int = 8,
+    steps: int = 1000,
+    max_learning_rate: float = 1e-5,
+    weight_decay: float = 0.1,
+    max_l2_norm: float = 1.0,
+    beta: float = 0.1,
+    # Checkpointing
+    load_model_path: str = None,
+    save_model_path: str = None,
+    # Device
+    device: torch.device = torch.device("mps"),
+    dtype: torch.dtype = torch.float32,
+    norm: bool = True,
+    rope: bool = True,
+    # Logging
+    val_interval: int = 50,
+    save_interval: int = 200,
+):
+    """Train model using Direct Preference Optimization (DPO)."""
+
+    min_learning_rate = 0.1 * max_learning_rate
+    warmup_iters = min(50, int(0.05 * steps))
+
+    # Create policy model
+    policy_model = Transformer(vocab_size, context_length, d_model, num_layers,
+                               num_heads, d_ff, rope_theta, None, device, dtype, norm=norm, rope=rope)
+
+    # Load weights from previous phase
+    _, _, model_config = load_checkpoint(load_model_path, policy_model, optimizers=None)
+
+    if model_config is None:
+        model_config = {"vocab_size": vocab_size, "context_length": context_length, "d_model": d_model,
+                        "num_layers": num_layers, "num_heads": num_heads, "d_ff": d_ff,
+                        "rope_theta": rope_theta, "weights": None, "device": device, "dtype": dtype}
+
+    # Create reference model (frozen copy)
+    ref_model = Transformer(vocab_size, context_length, d_model, num_layers,
+                            num_heads, d_ff, rope_theta, None, device, dtype, norm=norm, rope=rope)
+    load_checkpoint(load_model_path, ref_model, optimizers=None)
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad = False
+
+    # Optimizer (only for policy model)
+    optimizer = AdamW(policy_model.parameters(), max_learning_rate, weight_decay,
+                      betas=(0.9, 0.95), eps=1e-7)
+
+    # Load tokenizer and data
+    tokenizer = BPETokenizer()
+    tokenizer.load(tokenizer_path)
+
+    print(f"Loading pre-tokenized DPO data from {train_path}...")
+    dpo_data = load_dpo_data(train_path)
+    print(f"Loaded {len(dpo_data)} preference pairs")
+
+    # Setup wandb
+    num_parameters = policy_model.get_parameters(verbose=True)
+    wandb.init(
+        project="Transformer-from-scratch",
+        name="dpo-training",
+        config={
+            "phase": "DPO",
+            "max_lr": max_learning_rate,
+            "batch_size": batch_size,
+            "beta": beta,
+            "model_parameters_M": round(num_parameters / 1e6, 2),
+            "steps": steps,
+            "preference_pairs": len(dpo_data),
+        }
+    )
+    run_id = wandb.run.id
+
+    print(f"Starting DPO training on {device}")
+    best_accuracy = 0.0
+
+    for step in range(steps):
+        # Learning rate schedule
+        lr = lr_scheduler(step, max_learning_rate, min_learning_rate, warmup_iters, steps)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+        # Get batch and compute loss
+        batch = get_dpo_batch(dpo_data, batch_size, device)
+
+        policy_model.train()
+        optimizer.zero_grad()
+
+        loss, accuracy = dpo_loss(policy_model, ref_model, batch, beta, norm)
+
+        loss.backward()
+        gradient_clipping(policy_model.parameters(), max_l2_norm)
+        optimizer.step()
+
+        # Logging
+        if step % 10 == 0:
+            wandb.log({
+                "train/dpo_loss": loss.item(),
+                "train/accuracy": accuracy.item(),
+                "lr": lr,
+            }, step=step)
+
+        if step % val_interval == 0:
+            print(f"Step {step}: loss={loss.item():.4f}, acc={accuracy.item():.2%}, lr={lr:.2e}")
+
+            if step % save_interval == 0 and save_model_path and accuracy.item() > best_accuracy:
+                best_accuracy = accuracy.item()
+                save_checkpoint(policy_model, (optimizer,), step, save_model_path, run_id, model_config)
+
+                # Sample generations
+                print("\n" + "="*50)
+                print("Sampling model generations:")
+                test_prompts = [
+                    "<|user|>Who is Chris?<|assistant|>",
+                    "<|user|>What is Chris's home address?<|assistant|>",
+                ]
+                for prompt in test_prompts:
+                    decode(policy_model, tokenizer=tokenizer, x=prompt,
+                           num_tokens=60, temperature=0.7, top_p_threshold=0.9, norm=norm)
+                print("="*50 + "\n")
+
+    wandb.finish()
+    print(f"DPO training complete. Best accuracy: {best_accuracy:.2%}")

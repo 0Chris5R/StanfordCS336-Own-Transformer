@@ -33,8 +33,8 @@ def export_model_to_onnx(model_path: str, output_path: str):
         num_layers=config["num_layers"],
         num_heads=config["num_heads"],
         d_ff=config["d_ff"],
-        rope_theta=config["rope_theta"],
-        weights=config["weights"],
+        rope_theta=config.get("rope_theta", 10000.0),
+        weights=config.get("weights"),
         device="cpu",
         dtype=torch.float32,
         norm=True,
@@ -135,8 +135,9 @@ def export_tokenizer(tokenizer_path: str, output_dir: str):
 
 if __name__ == "__main__":
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    model_path = os.path.join(project_root, "checkpoints/model_owt.v3")
-    tokenizer_path = os.path.join(project_root, "checkpoints/tokenizer_owt.model")
+    # Use the SFT masked model
+    model_path = os.path.join(project_root, "checkpoints/sft_masked_v2.pt")
+    tokenizer_path = os.path.join(project_root, "checkpoints/tokenizer_continued.model")
     output_dir = os.path.dirname(os.path.abspath(__file__))
 
     export_model_to_onnx(model_path, os.path.join(output_dir, "model.onnx"))

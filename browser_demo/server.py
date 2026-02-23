@@ -19,6 +19,12 @@ from cs336_basics.tokenizer import BPETokenizer
 class LMHandler(SimpleHTTPRequestHandler):
     """HTTP handler that serves static files and generation API."""
 
+    def end_headers(self):
+        # Add Cross-Origin Isolation headers for SharedArrayBuffer (needed for WASM multi-threading)
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
+        super().end_headers()
+
     def do_POST(self):
         if self.path == '/api/generate':
             self.handle_generate()
@@ -66,8 +72,8 @@ device = None
 def load_model():
     global model, tokenizer, device
 
-    model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints/model_owt.v3")
-    tokenizer_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints/tokenizer_owt.model")
+    model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints/phase2.pt")
+    tokenizer_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "checkpoints/browser_lm_tokenizer.model")
 
     # Load tokenizer
     tokenizer = BPETokenizer()

@@ -39,8 +39,6 @@ class BPETokenizer {
 
         // Load special tokens
         this.specialTokens = data.special_tokens || [];
-
-        console.log(`Tokenizer loaded: vocab=${Object.keys(this.vocab).length}, merges=${this.merges.length}`);
     }
 
     _bytesToKey(bytes) {

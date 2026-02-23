@@ -8,6 +8,12 @@ let tokenizer = null;
 let modelConfig = null;
 let isGenerating = false;
 
+// Special token IDs (set after tokenizer loads)
+let THINK_TOKEN = null;
+let ANSWER_TOKEN = null;
+let REFUSE_TOKEN = null;
+let END_TOKEN = null;
+
 // DOM elements
 const statusEl = document.getElementById('status');
 const chatEl = document.getElementById('chat');
@@ -37,38 +43,41 @@ async function init() {
         // Load tokenizer
         tokenizer = new BPETokenizer();
         await tokenizer.load('tokenizer.json');
-        console.log('Tokenizer loaded');
+
+        // Get special token IDs
+        const specialTokens = tokenizer.specialTokens || [];
+        const baseOffset = 256; // Special tokens start after byte tokens
+        THINK_TOKEN = baseOffset + specialTokens.indexOf('<|think|>');
+        ANSWER_TOKEN = baseOffset + specialTokens.indexOf('<|answer|>');
+        REFUSE_TOKEN = baseOffset + specialTokens.indexOf('<|refuse|>');
+        END_TOKEN = baseOffset + specialTokens.indexOf('<|endoftext|>');
 
         // Load model config
         const configResponse = await fetch('model_config.json');
         modelConfig = await configResponse.json();
-        console.log('Model config:', modelConfig);
 
         updateStatus('Loading model (270MB, please wait)...', 'loading');
 
-        // Configure ONNX Runtime for best performance
-        ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+        // Configure ONNX Runtime (single-threaded for file:// protocol compatibility)
+        ort.env.wasm.numThreads = 1;
         ort.env.wasm.simd = true;
 
-        // Load ONNX model
+        // Load ONNX model with memory-optimized settings
         const startLoad = performance.now();
         session = await ort.InferenceSession.create('model.onnx', {
             executionProviders: ['wasm'],
             graphOptimizationLevel: 'all',
+            enableCpuMemArena: false,
+            enableMemPattern: false,
         });
         const loadTime = ((performance.now() - startLoad) / 1000).toFixed(1);
 
         updateStatus(`Model loaded in ${loadTime}s. Ready to generate!`, 'ready');
         inputEl.disabled = false;
         sendBtn.disabled = false;
-        inputEl.focus();
-
-        console.log('ONNX session created');
-        console.log('Input names:', session.inputNames);
-        console.log('Output names:', session.outputNames);
+        inputEl.focus({ preventScroll: true });
 
     } catch (error) {
-        console.error('Initialization error:', error);
         updateStatus(`Error: ${error.message}`, 'error');
     }
 }
@@ -85,6 +94,53 @@ function addMessage(text, role) {
     chatEl.appendChild(div);
     chatEl.scrollTop = chatEl.scrollHeight;
     return div;
+}
+
+function createAssistantMessage() {
+    const container = document.createElement('div');
+    container.className = 'message assistant';
+
+    // Thinking indicator (shown during thinking phase)
+    const thinkingIndicator = document.createElement('div');
+    thinkingIndicator.className = 'thinking-indicator';
+    thinkingIndicator.innerHTML = '<span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span> Thinking...';
+    container.appendChild(thinkingIndicator);
+
+    // Main response content
+    const responseContent = document.createElement('div');
+    responseContent.className = 'response-content';
+    container.appendChild(responseContent);
+
+    // CoT toggle (hidden by default, shown after generation if there's thinking)
+    const cotToggle = document.createElement('div');
+    cotToggle.className = 'cot-toggle';
+    cotToggle.style.display = 'none';
+    cotToggle.innerHTML = '<button class="cot-btn">Show reasoning</button>';
+    container.appendChild(cotToggle);
+
+    // CoT content (hidden by default)
+    const cotContent = document.createElement('div');
+    cotContent.className = 'cot-content';
+    cotContent.style.display = 'none';
+    container.appendChild(cotContent);
+
+    // Toggle functionality
+    cotToggle.querySelector('.cot-btn').addEventListener('click', () => {
+        const isHidden = cotContent.style.display === 'none';
+        cotContent.style.display = isHidden ? 'block' : 'none';
+        cotToggle.querySelector('.cot-btn').textContent = isHidden ? 'Hide reasoning' : 'Show reasoning';
+    });
+
+    chatEl.appendChild(container);
+    chatEl.scrollTop = chatEl.scrollHeight;
+
+    return {
+        container,
+        thinkingIndicator,
+        responseContent,
+        cotToggle,
+        cotContent
+    };
 }
 
 // Softmax with temperature
@@ -133,19 +189,23 @@ async function generate(prompt) {
     const topP = parseFloat(topPSlider.value);
     const maxTokens = parseInt(maxTSlider.value);
 
-    // Add user message
-    addMessage(prompt, 'user');
+    // Add user message (strip format tokens for display)
+    const displayText = prompt.replace('<|user|>', '').replace('<|assistant|>', '');
+    addMessage(displayText, 'user');
 
-    // Create assistant message element for streaming
-    const assistantDiv = addMessage('', 'assistant');
-    assistantDiv.classList.add('generating');
+    // Create structured assistant message
+    const msgElements = createAssistantMessage();
+
+    // Generation state
+    let phase = 'initial'; // 'initial' -> 'thinking' -> 'answering'
+    let thinkingText = '';
+    let answerText = '';
+    let responseType = null; // 'answer' or 'refuse'
 
     try {
         // Encode prompt
         let inputIds = tokenizer.encode(prompt);
-        console.log('Encoded prompt:', inputIds.slice(0, 10), '...');
 
-        let generatedText = '';
         let totalTokens = 0;
         const startTime = performance.now();
 
@@ -172,20 +232,60 @@ async function generate(prompt) {
             const startIdx = (seqLen - 1) * vocabSize;
             const lastLogits = Array.from(logits.slice(startIdx, startIdx + vocabSize));
 
+            // Dispose tensors to prevent memory leaks
+            if (inputTensor.dispose) inputTensor.dispose();
+            if (outputs.logits.dispose) outputs.logits.dispose();
+
             // Sample next token
             const probs = softmax(lastLogits, temperature);
             const nextToken = sampleTopP(probs, topP);
 
-            // Check for end of text token (256 = <|endoftext|>)
-            if (nextToken === 256) {
-                console.log('End of text token reached');
+            // Check for end of text token
+            if (nextToken === END_TOKEN) {
                 break;
             }
 
-            // Decode and display
+            // Handle special tokens for phase transitions
+            if (nextToken === THINK_TOKEN) {
+                phase = 'thinking';
+                inputIds.push(nextToken);
+                totalTokens++;
+                continue;
+            } else if (nextToken === ANSWER_TOKEN) {
+                phase = 'answering';
+                responseType = 'answer';
+                // Hide thinking indicator, prepare for answer
+                msgElements.thinkingIndicator.style.display = 'none';
+                inputIds.push(nextToken);
+                totalTokens++;
+                continue;
+            } else if (nextToken === REFUSE_TOKEN) {
+                phase = 'answering';
+                responseType = 'refuse';
+                // Hide thinking indicator, prepare for refusal
+                msgElements.thinkingIndicator.style.display = 'none';
+                inputIds.push(nextToken);
+                totalTokens++;
+                continue;
+            }
+
+            // Decode token
             const tokenText = tokenizer.decode([nextToken]);
-            generatedText += tokenText;
-            assistantDiv.textContent = generatedText;
+
+            // Update appropriate text based on phase
+            if (phase === 'thinking') {
+                thinkingText += tokenText;
+                // Keep showing thinking indicator
+            } else if (phase === 'answering') {
+                answerText += tokenText;
+                msgElements.responseContent.textContent = answerText;
+            } else {
+                // Initial phase - might be raw output without thinking
+                answerText += tokenText;
+                msgElements.thinkingIndicator.style.display = 'none';
+                msgElements.responseContent.textContent = answerText;
+            }
+
             chatEl.scrollTop = chatEl.scrollHeight;
 
             // Append to input for next iteration
@@ -196,21 +296,52 @@ async function generate(prompt) {
             await new Promise(r => setTimeout(r, 0));
         }
 
+        // Finalize display
+        msgElements.thinkingIndicator.style.display = 'none';
+
+        // Show CoT toggle if there was thinking
+        if (thinkingText.trim() || responseType) {
+            // Build CoT display with badge and classification
+            msgElements.cotContent.innerHTML = '';
+
+            // Add response type badge
+            if (responseType) {
+                const badge = document.createElement('span');
+                badge.className = `response-badge ${responseType === 'refuse' ? 'refused' : 'answered'}`;
+                badge.textContent = responseType === 'refuse' ? 'REFUSED' : 'ANSWERED';
+                msgElements.cotContent.appendChild(badge);
+            }
+
+            // Add classification text
+            if (thinkingText.trim()) {
+                const classificationDiv = document.createElement('div');
+                classificationDiv.style.marginTop = '0.5rem';
+                classificationDiv.innerHTML = `<strong>Classification:</strong> ${thinkingText.trim()}`;
+                msgElements.cotContent.appendChild(classificationDiv);
+            }
+
+            msgElements.cotToggle.style.display = 'block';
+        }
+
         const endTime = performance.now();
         const elapsed = (endTime - startTime) / 1000;
         const tokensPerSec = totalTokens / elapsed;
         statsEl.textContent = `Generated ${totalTokens} tokens in ${elapsed.toFixed(2)}s (${tokensPerSec.toFixed(1)} tok/s)`;
 
     } catch (error) {
-        console.error('Generation error:', error);
-        assistantDiv.textContent = `Error: ${error.message}`;
+        msgElements.thinkingIndicator.style.display = 'none';
+        msgElements.responseContent.textContent = `Error: ${error.message}`;
     }
 
-    assistantDiv.classList.remove('generating');
     isGenerating = false;
     sendBtn.disabled = false;
     inputEl.disabled = false;
-    inputEl.focus();
+    inputEl.focus({ preventScroll: true });
+}
+
+// Format user input for Q&A model
+function formatPrompt(userText) {
+    return `<|user|>${userText}<|assistant|>`;
 }
 
 // Event listeners
@@ -218,7 +349,7 @@ sendBtn.addEventListener('click', () => {
     const text = inputEl.value.trim();
     if (text) {
         inputEl.value = '';
-        generate(text);
+        generate(formatPrompt(text));
     }
 });
 
@@ -227,7 +358,7 @@ inputEl.addEventListener('keypress', (e) => {
         const text = inputEl.value.trim();
         if (text) {
             inputEl.value = '';
-            generate(text);
+            generate(formatPrompt(text));
         }
     }
 });
