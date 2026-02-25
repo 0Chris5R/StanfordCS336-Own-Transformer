@@ -450,7 +450,7 @@ def val_step(model, val_path, batch_size, context_length, device, norm=True) -> 
         return torch.mean(torch.stack(losses)).item()
 
 
-def decode(model_path, tokenizer, x, num_tokens, temperature=1, top_p_threshold=1, norm=True, rope=True) -> None:
+def decode(model_path, tokenizer, x, num_tokens, temperature=1, top_p_threshold=1, norm=True, rope=True, device=None) -> None:
 
     # Can take in either model path or model
 
@@ -475,14 +475,17 @@ def decode(model_path, tokenizer, x, num_tokens, temperature=1, top_p_threshold=
         )
 
         _, _, _ = load_checkpoint(model_path, model, None)
+        device = config["device"]
 
     else:
         model = model_path
+        if device is None:
+            device = next(model.parameters()).device
 
     print(x, end="", flush=True)
 
     # our model takes tensor(batch, seq) as input
-    x = torch.tensor(tokenizer.encode(x), device=model.device).unsqueeze(0)
+    x = torch.tensor(tokenizer.encode(x), device=device).unsqueeze(0)
 
     with torch.inference_mode():
 

@@ -51,9 +51,9 @@ def get_batch_sharded(dataset: np.ndarray | str, batch_size: int, context_length
     return inputs, targets
 
 
-def gradient_clipping_sharded(model, max_l2_norm):
+def gradient_clipping_sharded(model, max_l2_norm, device):
 
-    local_grad_norm = torch.tensor(0.0, device=model.device)
+    local_grad_norm = torch.tensor(0.0, device=device)
     for parameter in model.parameters():
         if parameter.grad is None:
             continue
@@ -227,7 +227,7 @@ def train_step_distributed(model, optimizers, train_path, batch_size, context_le
     model.finish_gradient_synchronization()
 
     if shard_gradient:
-        gradient_clipping_sharded(model, max_l2_norm)
+        gradient_clipping_sharded(model, max_l2_norm, device)
 
     else:
         gradient_clipping(model.parameters(), max_l2_norm)
@@ -274,6 +274,12 @@ def train_distributed(
 
     setup(rank, world_size, device)
 
+    if device.type == "cuda":
+        torch.cuda.set_device(rank)
+        data_device = "cuda"
+    else:
+        data_device = device.type
+
     if mixed_precision_dtype is None:
         torch_amp_autocast = nullcontext
     else:
@@ -285,7 +291,7 @@ def train_distributed(
     min_learning_rate = 0.1 * max_learning_rate
 
     model = Transformer(vocab_size, context_length, d_model, num_layers,
-                        num_heads, d_ff, rope_theta, None, device, dtype, norm=norm, rope=rope)
+                        num_heads, d_ff, rope_theta, None, data_device, dtype, norm=norm, rope=rope)
 
     tokenizer = BPETokenizer()
     tokenizer.load(tokenizer_path)
@@ -295,7 +301,7 @@ def train_distributed(
 
     if model_config is None:
         model_config = {"vocab_size": vocab_size, "context_length": context_length, "d_model": d_model, "num_layers": num_layers,
-                        "num_heads": num_heads, "d_ff": d_ff, "rope_theta": rope_theta, "weights": None, "device": device, "dtype": dtype}
+                        "num_heads": num_heads, "d_ff": d_ff, "rope_theta": rope_theta, "weights": None, "device": data_device, "dtype": dtype}
 
     model = DDPParameter(
         model, sharded=shard_gradient, use_muon=use_muon)
@@ -327,7 +333,7 @@ def train_distributed(
 
     if rank == 0:
         print("Compiling model")
-    if device.type == "cuda":
+    if data_device == "cuda":
         model = torch.compile(model)
 
     if rank == 0:
@@ -337,7 +343,7 @@ def train_distributed(
             verbose=True, batch_size=batch_size, use_muon=use_muon, ddp=True, world_size=world_size, shard_gradient=shard_gradient, shard_optimizer=shard_optimizer)
         model.module.get_training_time(verbose=True, steps=steps, ddp=True,
                                        batch_size=batch_size, world_size=world_size)
-        print(f"Training on {device.type}")
+        print(f"Training on {data_device}")
 
         wandb.init(
             project="Distributed Transformer",
@@ -412,7 +418,7 @@ def train_distributed(
                     print(
                         "Sampling a model generation to see current performance - Once upon a time: ...")
                     decode(model, tokenizer=tokenizer,
-                           x="Once upon a time", num_tokens=context_length, temperature=0.8, top_p_threshold=0.9, norm=norm)
+                           x="Once upon a time", num_tokens=context_length, temperature=0.8, top_p_threshold=0.9, norm=norm, device=data_device)
 
     if rank == 0:
         wandb.finish()
