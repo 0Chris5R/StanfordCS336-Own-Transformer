@@ -17,8 +17,11 @@ def cross_entropy(x: torch.Tensor, targets: torch.Tensor) -> float:
 
     # Using Log Sum exp trick:
 
+    dtype = x.dtype
+    x = x.to(torch.float32)
+
     m = torch.max(x, dim=-1, keepdim=True).values
-    return torch.mean((-x + m + torch.log(torch.sum(torch.exp(x-m), dim=-1, keepdim=True)))[torch.arange(x.shape[0]), targets])
+    return (torch.mean((-x + m + torch.log(torch.sum(torch.exp(x-m), dim=-1, keepdim=True)))[torch.arange(x.shape[0]), targets])).to(dtype)
 
 
 class AdamW(torch.optim.Optimizer):

@@ -153,9 +153,12 @@ class RoPE(nn.Module):
 
 def softmax(x: torch.Tensor, d: int = -1, temperature=1) -> torch.Tensor:
 
+    dtype = x.dtype
+    x = x.to(torch.float32)
+
     x = torch.exp((x-torch.max(x, dim=d, keepdim=True).values)/temperature)
 
-    return x/torch.sum(x, dim=d, keepdim=True)
+    return (x/torch.sum(x, dim=d, keepdim=True)).to(dtype)
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -217,7 +220,8 @@ class MultiHeadSelfAttention(nn.Module):
             output = self.scaled_dot_product_attention(
                 Q, K, V, precomputed_mask=self.causal_mask[:seq_len, :seq_len])
         else:
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
+            mask = torch.tril(torch.ones(seq_len, seq_len,
+                              device=x.device, dtype=torch.bool))
             output = self.scaled_dot_product_attention(Q, K, V, mask=mask)
 
         # Concatenate heads
@@ -392,7 +396,7 @@ class Transformer(nn.Module):
                 f"Output Projection: {flops_output*100/flops:.2f} % of FLOPS")
         return flops
 
-    def get_parameters(self, verbose=False, use_muon=False):
+    def get_parameters(self, verbose=False, use_muon=False, ddp=False):
         if use_muon:
             muon_params = 0
             adamw_params = 0
@@ -400,7 +404,12 @@ class Transformer(nn.Module):
                 if not p.requires_grad:
                     continue
 
-                if len(p.shape) == 2 and name not in ("output.W", "embedding.E"):
+                if ddp:
+                    non_muon = ("module.output.W, module.embedding.E")
+                else:
+                    non_muon = ("output.W", "embedding.E")
+
+                if len(p.shape) == 2 and name not in non_muon:
                     muon_params += p.numel()
                 else:
                     adamw_params += p.numel()
@@ -413,7 +422,7 @@ class Transformer(nn.Module):
                 f"The model has a total of {parameters/1e6:.2f} M Parameters")
         return parameters
 
-    def get_activation_size(self, verbose=False):
+    def get_activation_size(self, verbose=False, flash_attention=False):
         """
         Activation memory for training: what autograd saves for backward pass.
         Reference: https://blog.eleuther.ai/transformer-math/
@@ -426,27 +435,50 @@ class Transformer(nn.Module):
         n_heads = self.num_heads
         V = self.vocab_size
 
-        # Attention block
-        # 1. RMSNorm:
-        attn_norm_input = T * d
-        # 2. QKV projection:
-        qkv_input = T * d
-        # 3. Q, K matrices
-        qk_matrices = 2 * T * d
-        # 4. Attention scores:
-        attn_scores = n_heads * T * T
-        # 5. Softmax output
-        softmax_out = n_heads * T * T
-        # 6. V matrix
-        v_matrix = T * d
-        # 7. Attention output before projection
-        attn_out = T * d
-        # 8. Output projection input
-        out_proj_input = T * d
+        if flash_attention:
 
-        attn_per_layer = (attn_norm_input + qkv_input + qk_matrices +
-                          attn_scores + softmax_out + v_matrix +
-                          attn_out + out_proj_input)
+            # 1. RMSNorm:
+            attn_norm_input = T * d
+
+            qkv_input = T * d
+
+            # 3. Q, K, V matrices
+            qkv_matrices = 3 * T * d
+
+            # L
+            l = T
+
+            # 7. Attention output before projection
+            attn_out = T * d
+            # 8. Output projection input
+            out_proj_input = T * d
+
+            attn_per_layer = attn_norm_input + qkv_input + \
+                qkv_matrices + attn_out + out_proj_input + l
+
+        else:
+
+            # Attention block
+            # 1. RMSNorm:
+            attn_norm_input = T * d
+            # 2. QKV projection:
+            qkv_input = T * d
+            # 3. Q, K matrices
+            qk_matrices = 2 * T * d
+            # 4. Attention scores:
+            attn_scores = n_heads * T * T
+            # 5. Softmax output
+            softmax_out = n_heads * T * T
+            # 6. V matrix
+            v_matrix = T * d
+            # 7. Attention output before projection
+            attn_out = T * d
+            # 8. Output projection input
+            out_proj_input = T * d
+
+            attn_per_layer = (attn_norm_input + qkv_input + qk_matrices +
+                              attn_scores + softmax_out + v_matrix +
+                              attn_out + out_proj_input)
 
         # ffn(swiglu)
         # 1. RMSNormt
@@ -528,7 +560,7 @@ class Transformer(nn.Module):
                 f"Training the model takes a total of {flops/1e9:.2f} GFLOPS per batch per step")
         return flops
 
-    def get_training_memory(self, verbose=False, batch_size=1, use_muon=False):
+    def get_training_memory(self, verbose=False, batch_size=1, use_muon=False, ddp=False, world_size=None, shard_gradient=False, shard_optimizer=False):
         """
         Total memory for training including activations, weights, gradients, and optimizer states.
         Including empirical overhead factors for memory fragmentation and torch.compile.
@@ -536,7 +568,11 @@ class Transformer(nn.Module):
         # Memory fragmentation overhead from pytorch allocator
         FRAGMENTATION_FACTOR = 1.3
 
-        activation_mem = self.get_activation_size() * batch_size
+        activation_mem = self.get_activation_size(
+            flash_attention=ddp) * batch_size
+        if ddp:
+            activation_mem /= world_size
+
         model_mem = self.get_memory()
 
         if use_muon:
@@ -544,10 +580,22 @@ class Transformer(nn.Module):
                 verbose=False, use_muon=use_muon)
 
             # the optimizer needs gradients + momentum for muon (+ velocity) for adamw
-            optimizer_mem = memory_muon * 2 + memory_adamw * 3
+            if shard_gradient:
+                optimizer_mem = memory_muon * \
+                    (2/world_size) + memory_adamw * (3/world_size)
+            elif shard_optimizer:
+                optimizer_mem = memory_muon * \
+                    (1+1/world_size) + memory_adamw * (1+2/world_size)
+            else:
+                optimizer_mem = memory_muon * 2 + memory_adamw * 3
             base_memory = activation_mem + model_mem + optimizer_mem
         else:
-            optimizer_mem = model_mem * 3
+            if shard_gradient:
+                optimizer_mem = model_mem * (3/world_size)
+            elif shard_optimizer:
+                optimizer_mem = model_mem * (1+2/world_size)
+            else:
+                optimizer_mem = model_mem * 3
             base_memory = activation_mem + optimizer_mem
 
         total_memory = base_memory * FRAGMENTATION_FACTOR
@@ -563,10 +611,19 @@ class Transformer(nn.Module):
 
         return total_memory
 
-    def get_training_time(self, verbose=False, steps=None, batch_size=None):
+    def get_training_time(self, verbose=False, steps=None, batch_size=None, ddp=False, world_size=None):
 
         # For Macbook Pro M3 with MPS we can assume a realistic throughput of 10-20% of max throughput (7.4 TFLOP/S)
-        throughput = 1.15 * 1e12
+        if self.device == "mps":
+            throughput = 1.15 * 1e12
+
+        # For a T4 we might assume with Flash Attention and mixed precision:
+        if self.device == "cuda":
+            throughput = 12 * 1e12
+
+        # with distributed training assuming 15-20% DDP overhead:
+        if self.device == "cuda" and ddp:
+            throughput = 10 * 1e12 * world_size
 
         # FLOPS per step of training:
         flops = self.get_training_flops()
