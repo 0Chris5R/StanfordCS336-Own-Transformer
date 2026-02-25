@@ -3,12 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Dataset files 
+# Dataset files
 *.txt
 *.npy
 *.model
 *.vocab
 checkpoints/
+!checkpoints/tokenizer_owt.model
 wandb/
 
 # C extensions
