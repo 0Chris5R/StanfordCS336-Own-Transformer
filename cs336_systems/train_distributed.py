@@ -417,8 +417,11 @@ def train_distributed(
                 if rank == 0:
                     print(
                         "Sampling a model generation to see current performance - Once upon a time: ...")
-                    decode(model, tokenizer=tokenizer,
-                           x="Once upon a time", num_tokens=context_length, temperature=0.8, top_p_threshold=0.9, norm=norm, device=data_device)
+                    # Use uncompiled model for inference (avoids recompilation overhead)
+                    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+                    decode(base_model, tokenizer=tokenizer,
+                           x="Once upon a time", num_tokens=min(256, context_length - 20),
+                           temperature=0.8, top_p_threshold=0.9, norm=norm, device=data_device)
 
     if rank == 0:
         wandb.finish()
