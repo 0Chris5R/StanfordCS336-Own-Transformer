@@ -4,17 +4,32 @@ import triton
 import triton.language as tl
 
 
+def next_power_of_2(x):
+    return 1 << (x - 1).bit_length() if x > 0 else 1
+
+
 class FlashAttention(torch.autograd.Function):
 
     '''
     Triton Flash Attention 2 implementation with 2 backward kernels and explicit tile handling for causal masking. Works on 3 dimensional tensors (b, s, d) or (h, s, d). For Multi-Head Attention with batch_size > 1 input would need to be flattened and reshaped afterwards.
-    Matmuls in fp16 for T4 compatibility. 
+    Matmuls in fp16 for T4 compatibility.
     '''
 
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
 
         d = Q.shape[-1]
+        orig_seq_len = Q.shape[-2]
+
+        # Pad to next power of 2 (minimum 16) for Triton tensor core requirement
+        target_seq_len = max(16, next_power_of_2(orig_seq_len))
+        padded = orig_seq_len < target_seq_len
+        if padded:
+            pad_len = target_seq_len - orig_seq_len
+            Q = torch.nn.functional.pad(Q, (0, 0, 0, pad_len))
+            K = torch.nn.functional.pad(K, (0, 0, 0, pad_len))
+            V = torch.nn.functional.pad(V, (0, 0, 0, pad_len))
+
         N_QUERIES = Q.shape[-2]
         scale = 1/math.sqrt(d)
         # TILE SIZE dynamically determined based on seq_len and batch size. Would need to be made more distinct to work for arbitrary batch/head size. Current limit is at 128 for memory on T4.
@@ -44,6 +59,11 @@ class FlashAttention(torch.autograd.Function):
 
         ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
+        ctx.padded = padded
+        ctx.orig_seq_len = orig_seq_len
+
+        if padded:
+            O = O[..., :orig_seq_len, :]
 
         return O
 
@@ -51,6 +71,12 @@ class FlashAttention(torch.autograd.Function):
     def backward(ctx, grad_out):
 
         L, Q, K, V, O = ctx.saved_tensors
+        padded = ctx.padded
+        orig_seq_len = ctx.orig_seq_len
+        if padded:
+            target_seq_len = max(16, next_power_of_2(orig_seq_len))
+            pad_len = target_seq_len - orig_seq_len
+            grad_out = torch.nn.functional.pad(grad_out, (0, 0, 0, pad_len))
 
         d = Q.shape[-1]
         N_KEYS = K.shape[-2]
@@ -109,6 +135,11 @@ class FlashAttention(torch.autograd.Function):
             K_TILE_SIZE=K_TILE_SIZE,
             is_causal=is_causal
         )
+
+        if padded:
+            dQ = dQ[..., :orig_seq_len, :]
+            dK = dK[..., :orig_seq_len, :]
+            dV = dV[..., :orig_seq_len, :]
 
         return dQ, dK, dV, None
 

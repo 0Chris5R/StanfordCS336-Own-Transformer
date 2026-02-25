@@ -167,20 +167,9 @@ class MultiHeadFlashSelfAttention(nn.Module):
             Q = self.rope.forward(Q, token_positions)
             K = self.rope.forward(K, token_positions)
 
-        # our flash attention kernel only works for sequences >= 16
-        # for small sequences using normal attention is easier:
-        if seq_len <= 16:
-            mask = None
-            if self.mask:
-                mask = torch.tril(torch.ones(seq_len, seq_len,
-                                             device=x.device, dtype=torch.bool))
-            output = MultiHeadSelfAttention.scaled_dot_product_attention(
-                Q, K, V, mask)
-
-        else:
-            # Flash attention
-            # (batch * heads, seq, d_head)
-            output = FlashAttention.apply(Q, K, V, self.mask)
+        # Flash attention
+        # (batch * heads, seq, d_head)
+        output = FlashAttention.apply(Q, K, V, self.mask)
 
         # Reshape back
         output = output.view(batch, self.num_heads, seq_len, self.d_head)
