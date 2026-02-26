@@ -71,6 +71,8 @@ def gradient_clipping_sharded(model, max_l2_norm, device):
                 continue
             parameter.grad.mul_(scale)
 
+    return grad_norm
+
 
 def save_checkpoint_distributed(rank: int, model: torch.nn.Module, optimizers: tuple[torch.optim.Optimizer], iteration: int, out: str, run_id=None, model_config=None) -> None:
 
@@ -208,7 +210,7 @@ def val_step_distributed(model, val_path, batch_size, context_length, device, ra
         return local_loss
 
 
-def train_step_distributed(model, optimizers, train_path, batch_size, context_length, device, rank, world_size, step, norm, max_l2_norm,  shard_gradient, torch_amp_autocast):
+def train_step_distributed(model, optimizers, train_path, batch_size, context_length, device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast, accumulation_steps, is_accumulating):
 
     inputs, targets = get_batch_sharded(
         dataset=train_path, batch_size=batch_size, context_length=context_length, device=device, rank=rank, world_size=world_size, step=step)
@@ -218,25 +220,29 @@ def train_step_distributed(model, optimizers, train_path, batch_size, context_le
         logits = model(inputs, norm)
         loss = cross_entropy(logits.view(-1, logits.size(-1)),
                              targets.view(-1))
+        loss = loss / accumulation_steps
 
-    for optimizer in optimizers:
-        optimizer.zero_grad()
-
-    loss.backward()
-
-    model.finish_gradient_synchronization()
-
-    if shard_gradient:
-        gradient_clipping_sharded(model, max_l2_norm, device)
-
+    grad_norm = None
+    if is_accumulating:
+        with model.no_sync():
+            loss.backward()
     else:
-        gradient_clipping(model.parameters(), max_l2_norm)
+        loss.backward()
+        model.finish_gradient_synchronization()
 
-    for optimizer in optimizers:
-        optimizer.step()
+        if shard_gradient:
+            grad_norm = gradient_clipping_sharded(model, max_l2_norm, device)
+        else:
+            grad_norm = gradient_clipping(model.parameters(), max_l2_norm)
+
+        for optimizer in optimizers:
+            optimizer.step()
+
+        for optimizer in optimizers:
+            optimizer.zero_grad()
 
     if rank == 0:
-        return loss.item()
+        return loss.item() * accumulation_steps, grad_norm
 
 
 def train_distributed(
@@ -256,7 +262,9 @@ def train_distributed(
         batch_size: int = 32,
         context_length: int = 256,
         steps: int = 5000,
-        max_learning_rate: float = 5e-4,
+        accumulation_steps: int = 1,
+        lr_adamw: float = 5e-4,
+        lr_muon: float = 0.02,
         max_l2_norm: float = 1.0,
         device: torch.device = torch.device("cuda"),
         dtype: torch.dtype = torch.float32,
@@ -292,10 +300,16 @@ def train_distributed(
 
     cosine_cycle_iters = steps
     warmup_iters = min(100, int(0.02*steps))
-    min_learning_rate = 0.1 * max_learning_rate
+    min_learning_rate = 0.1 * lr_adamw
+    min_learning_rate_muon = 0.1 * lr_muon
 
     model = Transformer(vocab_size, context_length, d_model, num_layers,
                         num_heads, d_ff, rope_theta, None, data_device, dtype, norm=norm, rope=rope)
+
+    if rank == 0:
+        attn_layer = model.layers[0].mha
+        print(f"Attention class: {attn_layer.__class__.__name__}")
+        print(f"Using FlashAttention: {'Flash' in attn_layer.__class__.__name__}")
 
     tokenizer = BPETokenizer()
     tokenizer.load(tokenizer_path)
@@ -321,15 +335,15 @@ def train_distributed(
                 parameters_adam.append(param)
 
         optimizer_adam_ddp = ShardOptimizer(
-            parameters_adam, AdamW, max_learning_rate, weight_decay, betas, cautious_weight_decay)
+            parameters_adam, AdamW, lr_adamw, weight_decay, betas, cautious_weight_decay)
         optimizer_muon_ddp = ShardOptimizer(
-            parameters_muon, Muon, max_learning_rate,  weight_decay, betas[1], cautious_weight_decay)
+            parameters_muon, Muon, lr_muon, weight_decay, betas[1], cautious_weight_decay)
 
         optimizers = (optimizer_adam_ddp, optimizer_muon_ddp)
 
     else:
         optimizer_adam_ddp = ShardOptimizer(
-            model.parameters(), AdamW, max_learning_rate, weight_decay, betas, cautious_weight_decay)
+            model.parameters(), AdamW, lr_adamw, weight_decay, betas, cautious_weight_decay)
 
         optimizers = (optimizer_adam_ddp, )
 
@@ -355,8 +369,11 @@ def train_distributed(
             id=run_id,
             resume="allow",
             config={
-                "max_lr": max_learning_rate,
+                "max_lr_adam": lr_adamw,
+                "max_lr_muon": lr_muon,
                 "batch_size": batch_size,
+                "accumulation_steps": accumulation_steps,
+                "effective_batch_size": batch_size * accumulation_steps,
                 "model parameters in Million": round(num_parameters/1e6, 2),
                 "steps": steps,
                 "total_tokens": steps*batch_size*context_length,
@@ -373,31 +390,39 @@ def train_distributed(
         run_id = 0
 
     best_val_loss = float("inf")
+    last_grad_norm = 0.0
 
     for step in range(iteration, steps):
 
-        lr = lr_scheduler(step, max_learning_rate,
+        lr = lr_scheduler(step, lr_adamw,
                           min_learning_rate, warmup_iters, cosine_cycle_iters)
+        lr_m = lr_scheduler(step, lr_muon,
+                            min_learning_rate_muon, warmup_iters, cosine_cycle_iters)
 
-        for optimizer in optimizers:
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+        for param_group in optimizers[0].param_groups:
+            param_group["lr"] = lr
+        if use_muon:
+            for param_group in optimizers[1].param_groups:
+                param_group["lr"] = lr_m
 
-        loss = train_step_distributed(model, optimizers, train_path, batch_size, context_length,
-                                      device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast)
+        is_accumulating = (step + 1) % accumulation_steps != 0
+
+        result = train_step_distributed(model, optimizers, train_path, batch_size, context_length,
+                                         device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast, accumulation_steps, is_accumulating)
+        if rank == 0:
+            loss, grad_norm = result
+            last_grad_norm = grad_norm or last_grad_norm
 
         if step % 10 == 0:
             param_norm = torch.sqrt(
                 sum(p.norm()**2 for p in model.parameters())).item()
 
-            grad_norm = torch.sqrt(
-                sum(p.grad.norm()**2 for p in model.parameters() if p.grad is not None)).item()
-
             if rank == 0:
                 wandb.log({
                     "train/loss": loss,
-                    "lr": lr,
-                    "grad_norm": grad_norm,
+                    "lr_adamw": lr,
+                    "lr_muon": lr_m if use_muon else lr,
+                    "grad_norm": last_grad_norm,
                     "weight_norm": param_norm
 
                 }, step=step)
@@ -448,7 +473,9 @@ def run_distributed_training(
         # Training
         steps: int = 5000,
         batch_size: int = 32,
-        max_learning_rate: float = 5e-4,
+        accumulation_steps: int = 1,
+        lr_adamw: float = 5e-4,
+        lr_muon: float = 0.02,
         max_l2_norm: float = 1.0,
         weight_decay: float = 0.01,
         betas: tuple[float, float] = (0.9, 0.95),
@@ -503,7 +530,9 @@ def run_distributed_training(
             batch_size,
             context_length,
             steps,
-            max_learning_rate,
+            accumulation_steps,
+            lr_adamw,
+            lr_muon,
             max_l2_norm,
             device,
             dtype,
@@ -536,6 +565,7 @@ if __name__ == "__main__":
         rope_theta=10000,
         steps=10,
         batch_size=16,
+        accumulation_steps=10,
         shard_optimizer=True,
         shard_gradient=True,
         use_muon=True,

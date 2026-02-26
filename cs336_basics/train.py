@@ -17,11 +17,10 @@ def cross_entropy(x: torch.Tensor, targets: torch.Tensor) -> float:
 
     # Using Log Sum exp trick:
 
-    dtype = x.dtype
     x = x.to(torch.float32)
 
     m = torch.max(x, dim=-1, keepdim=True).values
-    return (torch.mean((-x + m + torch.log(torch.sum(torch.exp(x-m), dim=-1, keepdim=True)))[torch.arange(x.shape[0]), targets])).to(dtype)
+    return torch.mean((-x + m + torch.log(torch.sum(torch.exp(x-m), dim=-1, keepdim=True)))[torch.arange(x.shape[0]), targets])
 
 
 class AdamW(torch.optim.Optimizer):
@@ -175,8 +174,9 @@ def lr_scheduler(t, max_learning_rate: float,
     return min_learning_rate + 0.5 * (1 + math.cos((t - warmup_iters)/(cosine_cycle_iters-warmup_iters) * math.pi)) * (max_learning_rate-min_learning_rate)
 
 
-def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> float:
 
+    parameters = list(parameters)
     grad_norm = 0
     for parameter in parameters:
         if parameter.grad is None:
@@ -192,6 +192,8 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
             if parameter.grad is None:
                 continue
             parameter.grad.mul_(scale)
+
+    return grad_norm
 
 
 def get_batch(dataset: np.ndarray | str, batch_size: int, context_length: int, device: str, step: int = None
@@ -361,15 +363,12 @@ def train_together(
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
-        loss = train_step(model, optimizers, train_path,
+        loss, grad_norm = train_step(model, optimizers, train_path,
                           batch_size, context_length, device, max_l2_norm, step, norm=norm)
 
         if step % 10 == 0:
             param_norm = torch.sqrt(
                 sum(p.norm()**2 for p in model.parameters())).item()
-
-            grad_norm = torch.sqrt(
-                sum(p.grad.norm()**2 for p in model.parameters() if p.grad is not None)).item()
 
             wandb.log({
                 "train/loss": loss,
@@ -418,12 +417,12 @@ def train_step(model, optimizers: tuple, train_path, batch_size, context_length,
 
     loss.backward()
 
-    gradient_clipping(model.parameters(), max_l2_norm)
+    grad_norm = gradient_clipping(model.parameters(), max_l2_norm)
 
     for optimizer in optimizers:
         optimizer.step()
 
-    return loss.item()
+    return loss.item(), grad_norm
 
 
 def val_step(model, val_path, batch_size, context_length, device, step, norm=True) -> float:

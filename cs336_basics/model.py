@@ -624,13 +624,13 @@ class Transformer(nn.Module):
         if device_type == "mps":
             throughput = 1.15 * 1e12
 
-        # For a T4 we might assume with Flash Attention and mixed precision:
+        # For a T4 with Flash Attention and mixed precision:
         if device_type == "cuda":
-            throughput = 4 * 1e12
+            throughput = 15 * 1e12
 
-        # With distributed training on T4s - measured ~3.1 TFLOPS per GPU with DDP overhead
+        # With distributed training on T4s - measured ~13 TFLOPS per GPU with DDP + gradient accumulation
         if device_type == "cuda" and ddp:
-            throughput = 3.1 * 1e12 * world_size
+            throughput = 13 * 1e12 * world_size
 
         # FLOPS per step of training:
         flops = self.get_training_flops()

@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from contextlib import contextmanager
 
 
 class DDPParameter(torch.nn.Module):
@@ -14,6 +15,7 @@ class DDPParameter(torch.nn.Module):
         self.rank = dist.get_rank()
         self.sharded = sharded
         self.use_muon = use_muon
+        self.sync_gradients = True
         self.param_to_owner = self._construct_param_to_owner()
         for param in module.parameters():
             dist.broadcast(param.data, src=0)
@@ -23,6 +25,15 @@ class DDPParameter(torch.nn.Module):
 
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
+
+    @contextmanager
+    def no_sync(self):
+        old_sync = self.sync_gradients
+        self.sync_gradients = False
+        try:
+            yield
+        finally:
+            self.sync_gradients = old_sync
 
     def finish_gradient_synchronization(self):
         for handle in self.handles:
@@ -44,6 +55,8 @@ class DDPParameter(torch.nn.Module):
 
     def _hook_function(self):
         def hook(param):
+            if not self.sync_gradients:
+                return
             if self.sharded:
                 owner = self.param_to_owner[param]
                 handle = dist.reduce(param.grad, dst=owner,
