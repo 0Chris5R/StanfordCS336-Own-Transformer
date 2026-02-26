@@ -194,13 +194,13 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
             parameter.grad.mul_(scale)
 
 
-def get_batch(dataset: np.ndarray | str, batch_size: int, context_length: int, device: str
+def get_batch(dataset: np.ndarray | str, batch_size: int, context_length: int, device: str, step: int = None
               ) -> tuple[torch.Tensor, torch.Tensor]:
 
     if isinstance(dataset, str):
         dataset = np.load(dataset, mmap_mode='r')
 
-    random = np.random.default_rng()
+    random = np.random.default_rng(seed=step)
     starting_indices = random.integers(
         0, len(dataset)-context_length, batch_size)
 
@@ -362,7 +362,7 @@ def train_together(
                 param_group["lr"] = lr
 
         loss = train_step(model, optimizers, train_path,
-                          batch_size, context_length, device, max_l2_norm, norm=norm)
+                          batch_size, context_length, device, max_l2_norm, step, norm=norm)
 
         if step % 10 == 0:
             param_norm = torch.sqrt(
@@ -381,7 +381,7 @@ def train_together(
 
         if step % val_interval == 0:
             val_loss = val_step(model, val_path, batch_size,
-                                context_length, device, norm=norm)
+                                context_length, device, step, norm=norm)
 
             wandb.log({
                 "val/loss": val_loss,
@@ -402,10 +402,10 @@ def train_together(
     wandb.finish()
 
 
-def train_step(model, optimizers: tuple, train_path, batch_size, context_length, device, max_l2_norm, norm=True) -> float:
+def train_step(model, optimizers: tuple, train_path, batch_size, context_length, device, max_l2_norm, step, norm=True) -> float:
 
     inputs, targets = get_batch(
-        dataset=train_path, batch_size=batch_size, context_length=context_length, device=device)
+        dataset=train_path, batch_size=batch_size, context_length=context_length, device=device, step=step)
 
     model.train()
     logits = model(inputs, norm)
@@ -426,16 +426,16 @@ def train_step(model, optimizers: tuple, train_path, batch_size, context_length,
     return loss.item()
 
 
-def val_step(model, val_path, batch_size, context_length, device, norm=True) -> float:
+def val_step(model, val_path, batch_size, context_length, device, step, norm=True) -> float:
 
     with torch.inference_mode():
 
         losses = []
 
-        for _ in range(5):
+        for i in range(5):
 
             inputs, targets = get_batch(
-                dataset=val_path, batch_size=batch_size, context_length=context_length, device=device)
+                dataset=val_path, batch_size=batch_size, context_length=context_length, device=device, step=step + i)
 
             model.eval()
 

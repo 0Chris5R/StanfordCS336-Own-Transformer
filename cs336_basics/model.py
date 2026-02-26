@@ -560,7 +560,7 @@ class Transformer(nn.Module):
                 f"Training the model takes a total of {flops/1e9:.2f} GFLOPS per batch per step")
         return flops
 
-    def get_training_memory(self, verbose=False, batch_size=1, use_muon=False, ddp=False, world_size=None, shard_gradient=False, shard_optimizer=False):
+    def get_training_memory(self, verbose=False, batch_size=1, use_muon=False, ddp=False, world_size=None, shard_gradient=False, shard_optimizer=False, mixed_precision=False):
         """
         Total memory for training including activations, weights, gradients, and optimizer states.
         Including empirical overhead factors for memory fragmentation and torch.compile.
@@ -570,6 +570,11 @@ class Transformer(nn.Module):
 
         activation_mem = self.get_activation_size(
             flash_attention=ddp) * batch_size
+
+        # Mixed precision stores activations in fp16
+        if mixed_precision:
+            activation_mem /= 2
+
         if ddp:
             activation_mem /= world_size
 
@@ -602,28 +607,30 @@ class Transformer(nn.Module):
 
         if verbose:
             opt_name = "Muon + AdamW" if use_muon else "AdamW"
+            per_gpu_batch = batch_size // world_size if ddp and world_size else batch_size
             print(f"Training memory breakdown ({opt_name}):")
             print(f"  Model weights: {model_mem / 1e9:.3f} GB")
-            print(
-                f"  Activations (batch={batch_size}): {activation_mem / 1e9:.3f} GB")
+            print(f"  Activations (batch={per_gpu_batch} per GPU): {activation_mem / 1e9:.3f} GB")
             print(f"  Optimizer states: {optimizer_mem / 1e9:.3f} GB")
-            print(f"  Total Memory: {total_memory / 1e9:.3f} GB")
+            print(f"  Total Memory per GPU: {total_memory / 1e9:.3f} GB")
 
         return total_memory
 
     def get_training_time(self, verbose=False, steps=None, batch_size=None, ddp=False, world_size=None):
 
+        device_type = self.device.type if hasattr(self.device, 'type') else self.device
+
         # For Macbook Pro M3 with MPS we can assume a realistic throughput of 10-20% of max throughput (7.4 TFLOP/S)
-        if self.device == "mps":
+        if device_type == "mps":
             throughput = 1.15 * 1e12
 
         # For a T4 we might assume with Flash Attention and mixed precision:
-        if self.device == "cuda":
-            throughput = 12 * 1e12
+        if device_type == "cuda":
+            throughput = 4 * 1e12
 
-        # with distributed training assuming 15-20% DDP overhead:
-        if self.device == "cuda" and ddp:
-            throughput = 10 * 1e12 * world_size
+        # With distributed training on T4s - measured ~3.1 TFLOPS per GPU with DDP overhead
+        if device_type == "cuda" and ddp:
+            throughput = 3.1 * 1e12 * world_size
 
         # FLOPS per step of training:
         flops = self.get_training_flops()

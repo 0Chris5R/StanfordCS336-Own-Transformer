@@ -274,6 +274,10 @@ def train_distributed(
 
     setup(rank, world_size, device)
 
+    # Seed for reproducible model initialization across all ranks
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
     if device.type == "cuda":
         torch.cuda.set_device(rank)
         data_device = "cuda"
@@ -340,7 +344,7 @@ def train_distributed(
         print("Starting training")
         num_parameters = model.module.get_parameters(verbose=True)
         model.module.get_training_memory(
-            verbose=True, batch_size=batch_size, use_muon=use_muon, ddp=True, world_size=world_size, shard_gradient=shard_gradient, shard_optimizer=shard_optimizer)
+            verbose=True, batch_size=batch_size, use_muon=use_muon, ddp=True, world_size=world_size, shard_gradient=shard_gradient, shard_optimizer=shard_optimizer, mixed_precision=mixed_precision_dtype is not None)
         model.module.get_training_time(verbose=True, steps=steps, ddp=True,
                                        batch_size=batch_size, world_size=world_size)
         print(f"Training on {data_device}")
