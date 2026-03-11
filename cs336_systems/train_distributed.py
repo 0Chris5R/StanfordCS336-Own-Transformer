@@ -21,6 +21,71 @@ warnings.filterwarnings(
     "ignore", message=".*'repr'.*Field.*|.*'frozen'.*Field.*")
 
 
+class GradScaler():
+
+    def __init__(self, n_steps=2000, init_scale=2.0**16):
+
+        self.n_steps = n_steps
+        self.clean_steps = 0
+        self.clean_grad = True
+        self.scalef = init_scale
+
+    def scale(self, loss):
+
+        return loss * self.scalef
+
+    def unscale(self, optimizers):
+
+        found_inf = False
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    if param.grad is None:
+                        continue
+                    if torch.isinf(param.grad).any() or torch.isnan(param.grad).any():
+                        found_inf = True
+                        break
+                if found_inf:
+                    break
+            if found_inf:
+                break
+
+        if dist.is_initialized():
+            found_inf_tensor = torch.tensor(1.0 if found_inf else 0.0, device="cuda")
+            dist.all_reduce(found_inf_tensor, op=dist.ReduceOp.MAX)
+            found_inf = found_inf_tensor.item() > 0
+
+        if found_inf:
+            self.clean_grad = False
+            return
+
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    if param.grad is None:
+                        continue
+                    param.grad /= self.scalef
+
+    def step(self, optimizers):
+
+        if self.clean_grad:
+            for optimizer in optimizers:
+                optimizer.step()
+
+    def update(self):
+
+        if not self.clean_grad:
+            self.scalef *= 0.5
+            self.clean_grad = True
+            self.clean_steps = 0
+            return
+
+        self.clean_steps += 1
+        if self.clean_steps >= self.n_steps:
+            self.scalef *= 2
+            self.clean_steps = 0
+
+
 def setup(rank, world_size, device):
     if device.type == "cuda":
         backend = "nccl"
@@ -95,14 +160,14 @@ def load_checkpoint_distributed(
         model: torch.nn.Module = None,
         optimizers: tuple[torch.optim.Optimizer] = None) -> tuple[int, typing.Any, typing.Optional[dict]] | None:
 
-    if src is None or not os.path.exists(src):
+    if src is None or not os.path.exists(src+f"_rank{rank}.pt"):
         if rank == 0:
             print("No model to load - starting from scratch")
         return (0, None, None)
 
     checkpoint = torch.load(src+f"_rank{rank}.pt")
 
-    checkpoint["model"] = {k.replace("_orig_mod.", ""): v for k,
+    checkpoint["model"] = {k.replace("_orig_mod.", "").replace("module.", ""): v for k,
                            v in checkpoint["model"].items()}
     if model is not None:
         model.load_state_dict(checkpoint["model"])
@@ -210,7 +275,7 @@ def val_step_distributed(model, val_path, batch_size, context_length, device, ra
         return local_loss
 
 
-def train_step_distributed(model, optimizers, train_path, batch_size, context_length, device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast, accumulation_steps, is_accumulating):
+def train_step_distributed(model, optimizers, train_path, batch_size, context_length, device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast, accumulation_steps, is_accumulating, grad_scaler):
 
     inputs, targets = get_batch_sharded(
         dataset=train_path, batch_size=batch_size, context_length=context_length, device=device, rank=rank, world_size=world_size, step=step)
@@ -220,29 +285,39 @@ def train_step_distributed(model, optimizers, train_path, batch_size, context_le
         logits = model(inputs, norm)
         loss = cross_entropy(logits.view(-1, logits.size(-1)),
                              targets.view(-1))
-        loss = loss / accumulation_steps
+        unscaled_loss = loss.item()
+        step_loss = loss / accumulation_steps
+        if grad_scaler is not None:
+            step_loss = grad_scaler.scale(step_loss)
 
     grad_norm = None
     if is_accumulating:
         with model.no_sync():
-            loss.backward()
+            step_loss.backward()
     else:
-        loss.backward()
+        step_loss.backward()
         model.finish_gradient_synchronization()
+
+        if grad_scaler is not None:
+            grad_scaler.unscale(optimizers)
 
         if shard_gradient:
             grad_norm = gradient_clipping_sharded(model, max_l2_norm, device)
         else:
             grad_norm = gradient_clipping(model.parameters(), max_l2_norm)
 
-        for optimizer in optimizers:
-            optimizer.step()
+        if grad_scaler is not None:
+            grad_scaler.step(optimizers)
+            grad_scaler.update()
+        else:
+            for optimizer in optimizers:
+                optimizer.step()
 
         for optimizer in optimizers:
             optimizer.zero_grad()
 
     if rank == 0:
-        return loss.item() * accumulation_steps, grad_norm
+        return unscaled_loss, grad_norm
 
 
 def train_distributed(
@@ -309,7 +384,8 @@ def train_distributed(
     if rank == 0:
         attn_layer = model.layers[0].mha
         print(f"Attention class: {attn_layer.__class__.__name__}")
-        print(f"Using FlashAttention: {'Flash' in attn_layer.__class__.__name__}")
+        print(
+            f"Using FlashAttention: {'Flash' in attn_layer.__class__.__name__}")
 
     tokenizer = BPETokenizer()
     tokenizer.load(tokenizer_path)
@@ -347,7 +423,7 @@ def train_distributed(
 
         optimizers = (optimizer_adam_ddp, )
 
-    load_checkpoint_distributed(rank, load_model_path, model, optimizers)
+    load_checkpoint_distributed(rank, load_model_path, None, optimizers)
 
     if rank == 0:
         print("Compiling model")
@@ -389,6 +465,8 @@ def train_distributed(
     else:
         run_id = 0
 
+    grad_scaler = GradScaler() if mixed_precision_dtype is not None else None
+
     best_val_loss = float("inf")
     last_grad_norm = 0.0
 
@@ -408,7 +486,7 @@ def train_distributed(
         is_accumulating = (step + 1) % accumulation_steps != 0
 
         result = train_step_distributed(model, optimizers, train_path, batch_size, context_length,
-                                         device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast, accumulation_steps, is_accumulating)
+                                        device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast, accumulation_steps, is_accumulating, grad_scaler)
         if rank == 0:
             loss, grad_norm = result
             last_grad_norm = grad_norm or last_grad_norm
@@ -437,17 +515,20 @@ def train_distributed(
                     "val/perplexity": math.exp(val_loss),
                 }, step=step)
 
-            # Only compare against best_val_loss at save_interval steps
-            if step % save_interval == 0 and save_model_path is not None and val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if step % save_interval == 0 and save_model_path is not None:
                 save_checkpoint_distributed(
                     rank, model, optimizers, step, save_model_path, run_id, model_config)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_checkpoint_distributed(
+                        rank, model, optimizers, step, save_model_path + "_best", run_id, model_config)
 
                 if rank == 0:
                     print(
                         "Sampling a model generation to see current performance - Once upon a time: ...")
-                    # Use uncompiled model for inference (avoids recompilation overhead)
-                    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+                    base_model = model._orig_mod if hasattr(
+                        model, '_orig_mod') else model
                     decode(base_model, tokenizer=tokenizer,
                            x="Once upon a time", num_tokens=min(256, context_length - 20),
                            temperature=0.8, top_p_threshold=0.9, norm=norm, device=data_device)
