@@ -252,7 +252,7 @@ def val_step_distributed(model, val_path, batch_size, context_length, device, ra
     with torch.inference_mode():
         losses = []
 
-        for _ in range(5):
+        for _ in range(20):
 
             inputs, targets = get_batch_sharded(
                 dataset=val_path, batch_size=batch_size, context_length=context_length, device=device, rank=rank, world_size=world_size, step=step)
@@ -469,6 +469,8 @@ def train_distributed(
 
     best_val_loss = float("inf")
     last_grad_norm = 0.0
+    accumulated_loss = 0.0
+    optimizer_step_count = iteration // accumulation_steps
 
     for step in range(iteration, steps):
 
@@ -489,21 +491,24 @@ def train_distributed(
                                         device, rank, world_size, step, norm, max_l2_norm, shard_gradient, torch_amp_autocast, accumulation_steps, is_accumulating, grad_scaler)
         if rank == 0:
             loss, grad_norm = result
+            accumulated_loss += loss
             last_grad_norm = grad_norm or last_grad_norm
 
-        if step % 10 == 0:
-            param_norm = torch.sqrt(
-                sum(p.norm()**2 for p in model.parameters())).item()
-
+        if not is_accumulating:
+            optimizer_step_count += 1
             if rank == 0:
+                avg_loss = accumulated_loss / accumulation_steps
+                param_norm = torch.sqrt(
+                    sum(p.norm()**2 for p in model.parameters())).item()
                 wandb.log({
-                    "train/loss": loss,
+                    "train/loss": avg_loss,
                     "lr_adamw": lr,
                     "lr_muon": lr_m if use_muon else lr,
                     "grad_norm": last_grad_norm,
-                    "weight_norm": param_norm
-
+                    "weight_norm": param_norm,
+                    "optimizer_step": optimizer_step_count
                 }, step=step)
+                accumulated_loss = 0.0
 
         if step % val_interval == 0:
             val_loss = val_step_distributed(
